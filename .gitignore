@@ -8,3 +8,4 @@ result-*
 /firmware/**/sdkconfig
 /firmware/**/sdkconfig.old
 /firmware/**/managed_components
+scurry.toml
