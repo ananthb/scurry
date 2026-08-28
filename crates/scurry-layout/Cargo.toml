@@ -1,0 +1,16 @@
+[package]
+name = "scurry-layout"
+description = "The virtual desktop and pointer handoff rules, shared by the controller and the dongle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# no_std and allocation-free so the identical engine runs on the controller and
+# on the dongle's riscv32imc core. Zero dependencies for the same reason.
+[dependencies]
+scurry-proto = { path = "../scurry-proto", default-features = false }
+
+[features]
+default = ["std"]
+std = ["scurry-proto/std"]

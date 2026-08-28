@@ -68,6 +68,9 @@
           packages = [
             nixpkgs-esp-dev.packages.${system}.esp-idf-riscv
             pkgs.espflash
+            # The firmware build shells out to cargo to compile the Rust layout
+            # engine for riscv32imc, so the toolchain has to be on PATH here too.
+            rustToolchain
           ];
         };
 

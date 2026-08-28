@@ -1,62 +1,95 @@
-//! Wire format shared by the scurry controller, the dongle, and the nodes.
+//! Wire format between the scurry controller and the dongle.
 //!
-//! # Why the frame looks like this
+//! # Shape
 //!
-//! ESP-NOW is an unreliable datagram transport: frames can be dropped or
-//! reordered, and there is no retransmit. Two consequences shape the format.
-//!
-//! First, **button state is absolute, not a press/release delta**. If a release
-//! were a separate event and its frame were dropped, the target would be left
-//! with a button stuck down and no way to recover — the single worst failure
-//! mode this protocol could have. Sending the full button bitmask in every
-//! frame means the next frame to arrive always repairs the state.
-//!
-//! Motion, by contrast, *is* a delta. A dropped motion frame costs a few pixels
-//! of pointer travel and self-corrects on the next movement, which is a far
-//! cheaper failure than absolute coordinates going stale.
-//!
-//! Second, every frame carries a sequence number so a receiver can discard
-//! reordered stragglers rather than apply motion backwards.
-//!
-//! # Layout
-//!
-//! Fixed 16 bytes, little-endian. ESP-NOW allows 250, so there is ample room to
-//! grow, but a fixed size means no length negotiation and no allocation.
+//! An 8-byte header followed by a length-prefixed payload.
 //!
 //! ```text
 //! 0       magic 0x53
 //! 1       version
 //! 2       kind
-//! 3       node id
+//! 3       flags (reserved)
 //! 4..6    seq (u16)
-//! 6..16   payload, kind-specific
+//! 6..8    payload length (u16)
+//! 8..     payload
 //! ```
+//!
+//! A mouse update carries an 8-byte payload, so the hot path is still exactly
+//! 16 bytes on the wire — the length prefix costs nothing there but lets config
+//! messages be arbitrarily long.
+//!
+//! # The controller does not route
+//!
+//! The layout lives on the dongle, so the controller sends *raw* pointer motion
+//! and has no opinion about which machine it lands on. That is what lets the
+//! same firmware run standalone with no controller at all.
+//!
+//! # Buttons are absolute
+//!
+//! BLE does not retransmit. If a release were its own event and its frame were
+//! dropped, a button would be stuck down on a machine the user is not sitting
+//! at — the worst failure this protocol could have. Every update carries the
+//! full button bitmask, so the next one repairs the state. Motion is a delta,
+//! because a dropped motion frame costs a few pixels and self-corrects.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
-/// Every frame starts with this byte. Cheap rejection of foreign traffic that
-/// happens to land on the same ESP-NOW peer.
 pub const MAGIC: u8 = 0x53;
+pub const VERSION: u8 = 2;
 
-/// Bumped on any incompatible layout change. A node refuses mismatched frames
-/// rather than misinterpreting them.
-pub const VERSION: u8 = 1;
+/// Bytes before the payload.
+pub const HEADER_LEN: usize = 8;
 
-/// Wire size of every frame, in bytes.
-pub const FRAME_LEN: usize = 16;
+/// Largest payload we will accept. Bounds the dongle's reassembly buffer, which
+/// has no allocator to grow one.
+pub const MAX_PAYLOAD: usize = 256;
 
-/// Broadcast node id, addressed to every node.
-pub const NODE_BROADCAST: u8 = 0xFF;
+/// One local screen plus up to four bonded targets.
+pub const MAX_SCREENS: usize = 5;
 
-/// Mouse buttons, as bitmask positions matching the USB HID boot-protocol
-/// mouse report, so a node can forward the low bits without remapping.
+/// Screen names are fixed-width so neither side needs an allocator.
+pub const NAME_LEN: usize = 16;
+
+/// Bytes one screen occupies on the wire.
+pub const SCREEN_WIRE_LEN: usize = 1 + NAME_LEN + 16;
+
 pub mod button {
     pub const LEFT: u8 = 1 << 0;
     pub const RIGHT: u8 = 1 << 1;
     pub const MIDDLE: u8 = 1 << 2;
     pub const BACK: u8 = 1 << 3;
     pub const FORWARD: u8 = 1 << 4;
+}
+
+/// Message kinds. Control messages start at 0x10 so the hot path stays in the
+/// low numbers and a reader can tell the classes apart at a glance.
+pub mod kind {
+    /// Controller -> dongle: raw pointer motion. The dongle routes it.
+    pub const MOUSE: u8 = 0x01;
+    pub const PING: u8 = 0x04;
+    pub const PONG: u8 = 0x05;
+
+    /// Controller -> dongle: send me the stored layout.
+    pub const GET_CONFIG: u8 = 0x10;
+    /// Either direction: a full layout.
+    pub const CONFIG: u8 = 0x11;
+    /// Controller -> dongle: replace the stored layout and persist it.
+    pub const SET_CONFIG: u8 = 0x12;
+    /// Controller -> dongle: report bonded targets and connection state.
+    pub const GET_STATUS: u8 = 0x13;
+    /// Dongle -> controller: bonded targets and connection state.
+    pub const STATUS: u8 = 0x14;
+    /// Dongle -> controller: result of a request.
+    pub const ACK: u8 = 0x15;
+}
+
+/// Result codes carried by [`kind::ACK`].
+pub mod ack {
+    pub const OK: u8 = 0;
+    pub const BAD_REQUEST: u8 = 1;
+    pub const INVALID_LAYOUT: u8 = 2;
+    pub const STORAGE_FAILED: u8 = 3;
 }
 
 /// Which screen edge a pointer crossed.
@@ -70,8 +103,6 @@ pub enum Edge {
 
 impl Edge {
     /// The edge a pointer arrives at, given the edge it departed from.
-    ///
-    /// Leaving your right edge means arriving at the neighbour's left.
     pub fn opposite(self) -> Self {
         match self {
             Edge::Left => Edge::Right,
@@ -80,128 +111,159 @@ impl Edge {
             Edge::Bottom => Edge::Top,
         }
     }
+}
 
-    fn to_wire(self) -> u8 {
-        match self {
-            Edge::Left => 0,
-            Edge::Right => 1,
-            Edge::Top => 2,
-            Edge::Bottom => 3,
-        }
+/// A relative pointer update. Buttons are absolute state; motion is a delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseState {
+    pub buttons: u8,
+    pub dx: i16,
+    pub dy: i16,
+    pub wheel: i8,
+    pub pan: i8,
+}
+
+impl MouseState {
+    pub const WIRE_LEN: usize = 8;
+
+    pub fn encode(&self) -> [u8; Self::WIRE_LEN] {
+        let mut b = [0u8; Self::WIRE_LEN];
+        b[0] = self.buttons;
+        b[1..3].copy_from_slice(&self.dx.to_le_bytes());
+        b[3..5].copy_from_slice(&self.dy.to_le_bytes());
+        b[5] = self.wheel as u8;
+        b[6] = self.pan as u8;
+        b
     }
 
-    fn from_wire(b: u8) -> Option<Self> {
-        Some(match b {
-            0 => Edge::Left,
-            1 => Edge::Right,
-            2 => Edge::Top,
-            3 => Edge::Bottom,
-            _ => return None,
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::WIRE_LEN {
+            return None;
+        }
+        Some(Self {
+            buttons: b[0],
+            dx: i16::from_le_bytes([b[1], b[2]]),
+            dy: i16::from_le_bytes([b[3], b[4]]),
+            wheel: b[5] as i8,
+            pan: b[6] as i8,
         })
     }
 }
 
-/// A relative mouse update. Buttons are absolute state; motion is a delta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MouseState {
-    /// Absolute button bitmask. See [`button`].
-    pub buttons: u8,
-    pub dx: i16,
-    pub dy: i16,
-    /// Vertical wheel, positive is away from the user.
-    pub wheel: i8,
-    /// Horizontal wheel, positive is rightward.
-    pub pan: i8,
-}
-
-/// One decoded protocol frame.
+/// One screen, as it appears inside a [`kind::CONFIG`] payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Payload {
-    /// Pointer activity for whichever node currently holds focus.
-    Mouse(MouseState),
-    /// The pointer has entered this node's screen at `edge`, `ratio` of the way
-    /// along it (0 = top/left corner, u16::MAX = bottom/right).
-    Enter { edge: Edge, ratio: u16 },
-    /// The pointer has left this node's screen.
-    ///
-    /// A node receiving this MUST release every held button. Otherwise a drag
-    /// that crosses a screen boundary would strand a held button on the machine
-    /// being departed.
-    Leave,
-    /// Liveness probe, echoed back as [`Payload::Pong`].
-    Ping,
-    Pong,
+pub struct ScreenWire {
+    pub node: u8,
+    pub name: [u8; NAME_LEN],
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
-impl Payload {
-    fn kind(&self) -> u8 {
-        match self {
-            Payload::Mouse(_) => 1,
-            Payload::Enter { .. } => 2,
-            Payload::Leave => 3,
-            Payload::Ping => 4,
-            Payload::Pong => 5,
+impl ScreenWire {
+    pub fn encode_into(&self, out: &mut [u8]) {
+        out[0] = self.node;
+        out[1..1 + NAME_LEN].copy_from_slice(&self.name);
+        let base = 1 + NAME_LEN;
+        out[base..base + 4].copy_from_slice(&self.x.to_le_bytes());
+        out[base + 4..base + 8].copy_from_slice(&self.y.to_le_bytes());
+        out[base + 8..base + 12].copy_from_slice(&self.width.to_le_bytes());
+        out[base + 12..base + 16].copy_from_slice(&self.height.to_le_bytes());
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < SCREEN_WIRE_LEN {
+            return None;
         }
+        let mut name = [0u8; NAME_LEN];
+        name.copy_from_slice(&b[1..1 + NAME_LEN]);
+        let base = 1 + NAME_LEN;
+        let rd = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Some(Self {
+            node: b[0],
+            name,
+            x: rd(base),
+            y: rd(base + 4),
+            width: rd(base + 8),
+            height: rd(base + 12),
+        })
+    }
+
+    pub fn name_str(&self) -> &str {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(NAME_LEN);
+        core::str::from_utf8(&self.name[..end]).unwrap_or("")
+    }
+
+    pub fn with_name(node: u8, name: &str, x: i32, y: i32, width: i32, height: i32) -> Self {
+        let mut buf = [0u8; NAME_LEN];
+        let src = name.as_bytes();
+        let n = core::cmp::min(src.len(), NAME_LEN);
+        buf[..n].copy_from_slice(&src[..n]);
+        Self { node, name: buf, x, y, width, height }
     }
 }
 
-/// A frame as it appears on the wire.
+/// One bonded target, as it appears inside a [`kind::STATUS`] payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Frame {
-    pub node: u8,
-    pub seq: u16,
-    pub payload: Payload,
+pub struct SlotStatus {
+    /// Connection slot, 0-based. Node ids are `slot + 1`.
+    pub slot: u8,
+    pub connected: bool,
+    /// Peer Bluetooth address, all zero when never bonded.
+    pub bda: [u8; 6],
 }
 
-/// Why a byte slice could not be decoded into a [`Frame`].
+impl SlotStatus {
+    pub const WIRE_LEN: usize = 8;
+
+    pub fn encode_into(&self, out: &mut [u8]) {
+        out[0] = self.slot;
+        out[1] = u8::from(self.connected);
+        out[2..8].copy_from_slice(&self.bda);
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let mut bda = [0u8; 6];
+        bda.copy_from_slice(&b[2..8]);
+        Some(Self { slot: b[0], connected: b[1] != 0, bda })
+    }
+}
+
+/// A parsed message header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    pub kind: u8,
+    pub seq: u16,
+    pub len: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// Slice was shorter than [`FRAME_LEN`].
+    /// Fewer than [`HEADER_LEN`] bytes available.
     Truncated,
-    /// First byte was not [`MAGIC`]; almost certainly not ours.
     BadMagic,
-    /// Known framing, unknown protocol version.
     VersionMismatch { got: u8 },
-    /// Version matched but the kind byte is not one we handle.
-    UnknownKind(u8),
-    /// Kind was valid but a field within the payload was not.
-    MalformedPayload,
+    /// Payload length exceeds [`MAX_PAYLOAD`]; refuse rather than try to buffer.
+    Oversized(u16),
 }
 
-impl Frame {
-    pub fn new(node: u8, seq: u16, payload: Payload) -> Self {
-        Self { node, seq, payload }
-    }
-
-    /// Serialise into exactly [`FRAME_LEN`] bytes.
-    pub fn encode(&self) -> [u8; FRAME_LEN] {
-        let mut b = [0u8; FRAME_LEN];
+impl Header {
+    pub fn encode(kind: u8, seq: u16, len: u16) -> [u8; HEADER_LEN] {
+        let mut b = [0u8; HEADER_LEN];
         b[0] = MAGIC;
         b[1] = VERSION;
-        b[2] = self.payload.kind();
-        b[3] = self.node;
-        b[4..6].copy_from_slice(&self.seq.to_le_bytes());
-
-        match self.payload {
-            Payload::Mouse(m) => {
-                b[6] = m.buttons;
-                b[8..10].copy_from_slice(&m.dx.to_le_bytes());
-                b[10..12].copy_from_slice(&m.dy.to_le_bytes());
-                b[12] = m.wheel as u8;
-                b[13] = m.pan as u8;
-            }
-            Payload::Enter { edge, ratio } => {
-                b[6] = edge.to_wire();
-                b[8..10].copy_from_slice(&ratio.to_le_bytes());
-            }
-            Payload::Leave | Payload::Ping | Payload::Pong => {}
-        }
+        b[2] = kind;
+        b[4..6].copy_from_slice(&seq.to_le_bytes());
+        b[6..8].copy_from_slice(&len.to_le_bytes());
         b
     }
 
-    /// Parse a frame, rejecting anything not addressed to this protocol.
     pub fn decode(b: &[u8]) -> Result<Self, DecodeError> {
-        if b.len() < FRAME_LEN {
+        if b.len() < HEADER_LEN {
             return Err(DecodeError::Truncated);
         }
         if b[0] != MAGIC {
@@ -210,38 +272,19 @@ impl Frame {
         if b[1] != VERSION {
             return Err(DecodeError::VersionMismatch { got: b[1] });
         }
-        let node = b[3];
-        let seq = u16::from_le_bytes([b[4], b[5]]);
-
-        let payload = match b[2] {
-            1 => Payload::Mouse(MouseState {
-                buttons: b[6],
-                dx: i16::from_le_bytes([b[8], b[9]]),
-                dy: i16::from_le_bytes([b[10], b[11]]),
-                wheel: b[12] as i8,
-                pan: b[13] as i8,
-            }),
-            2 => Payload::Enter {
-                edge: Edge::from_wire(b[6]).ok_or(DecodeError::MalformedPayload)?,
-                ratio: u16::from_le_bytes([b[8], b[9]]),
-            },
-            3 => Payload::Leave,
-            4 => Payload::Ping,
-            5 => Payload::Pong,
-            k => return Err(DecodeError::UnknownKind(k)),
-        };
-
-        Ok(Frame { node, seq, payload })
+        let len = u16::from_le_bytes([b[6], b[7]]);
+        if len as usize > MAX_PAYLOAD {
+            return Err(DecodeError::Oversized(len));
+        }
+        Ok(Header { kind: b[2], seq: u16::from_le_bytes([b[4], b[5]]), len })
     }
 }
 
 /// Tracks sequence numbers so a receiver can drop reordered stragglers.
 ///
-/// Sequence numbers wrap at [`u16::MAX`], so "newer" is defined by signed
-/// distance on the wrapped circle rather than by `>`. A frame more than half
-/// the sequence space ahead is treated as old, which is the standard trick and
-/// is correct as long as we never have 32768 frames in flight — at a 1kHz
-/// report rate that would be 32 seconds of buffering.
+/// Sequence numbers wrap at [`u16::MAX`], so "newer" is signed distance on the
+/// wrapped circle rather than `>`. A naive comparison would stall the stream for
+/// 32k messages every time the counter wrapped.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SeqGate {
     last: Option<u16>,
@@ -252,8 +295,6 @@ impl SeqGate {
         Self { last: None }
     }
 
-    /// Returns true if `seq` is newer than everything seen so far, and records
-    /// it. Returns false for duplicates and stragglers, which should be ignored.
     pub fn accept(&mut self, seq: u16) -> bool {
         match self.last {
             None => {
@@ -261,7 +302,7 @@ impl SeqGate {
                 true
             }
             Some(prev) => {
-                if seq.wrapping_sub(prev) != 0 && (seq.wrapping_sub(prev) as i16) > 0 {
+                if (seq.wrapping_sub(prev) as i16) > 0 {
                     self.last = Some(seq);
                     true
                 } else {
@@ -276,64 +317,80 @@ impl SeqGate {
 mod tests {
     use super::*;
 
-    fn roundtrip(p: Payload) {
-        let f = Frame::new(7, 1234, p);
-        let decoded = Frame::decode(&f.encode()).expect("decodes");
-        assert_eq!(f, decoded);
+    #[test]
+    fn mouse_stays_sixteen_bytes_on_the_wire() {
+        // The hot path must not have grown when the length prefix was added.
+        assert_eq!(HEADER_LEN + MouseState::WIRE_LEN, 16);
     }
 
     #[test]
-    fn every_payload_roundtrips() {
-        roundtrip(Payload::Mouse(MouseState {
+    fn header_roundtrips() {
+        let h = Header::encode(kind::MOUSE, 1234, 8);
+        let got = Header::decode(&h).unwrap();
+        assert_eq!(got, Header { kind: kind::MOUSE, seq: 1234, len: 8 });
+    }
+
+    #[test]
+    fn mouse_roundtrips_including_negatives() {
+        // Sign handling through the byte layout is the easiest thing to get
+        // wrong, and shows up as a pointer that only moves down and right.
+        let m = MouseState {
             buttons: button::LEFT | button::MIDDLE,
-            dx: -1234,
-            dy: 5678,
-            wheel: -3,
-            pan: 2,
-        }));
-        roundtrip(Payload::Enter { edge: Edge::Top, ratio: 40000 });
-        roundtrip(Payload::Leave);
-        roundtrip(Payload::Ping);
-        roundtrip(Payload::Pong);
+            dx: i16::MIN,
+            dy: -1,
+            wheel: i8::MIN,
+            pan: -1,
+        };
+        assert_eq!(MouseState::decode(&m.encode()).unwrap(), m);
     }
 
     #[test]
-    fn encodes_to_fixed_width() {
-        assert_eq!(Frame::new(0, 0, Payload::Leave).encode().len(), FRAME_LEN);
+    fn screen_roundtrips() {
+        let s = ScreenWire::with_name(1, "chromebook", -100, 262, 1920, 1080);
+        let mut buf = [0u8; SCREEN_WIRE_LEN];
+        s.encode_into(&mut buf);
+        let got = ScreenWire::decode(&buf).unwrap();
+        assert_eq!(got, s);
+        assert_eq!(got.name_str(), "chromebook");
     }
 
     #[test]
-    fn negative_motion_survives_the_wire() {
-        // i16/i8 sign handling through the byte layout is the easiest thing to
-        // get wrong here, and it would show up as a pointer that only moves
-        // down and right.
-        let m = MouseState { buttons: 0, dx: i16::MIN, dy: -1, wheel: i8::MIN, pan: -1 };
-        let f = Frame::new(0, 0, Payload::Mouse(m));
-        match Frame::decode(&f.encode()).unwrap().payload {
-            Payload::Mouse(got) => assert_eq!(got, m),
-            other => panic!("wrong payload: {other:?}"),
-        }
+    fn screen_name_truncates_without_panicking() {
+        let s = ScreenWire::with_name(1, "a-name-far-longer-than-sixteen", 0, 0, 1, 1);
+        assert_eq!(s.name_str().len(), NAME_LEN);
     }
 
     #[test]
-    fn rejects_foreign_and_malformed_frames() {
-        assert_eq!(Frame::decode(&[]), Err(DecodeError::Truncated));
-        assert_eq!(Frame::decode(&[0u8; FRAME_LEN]), Err(DecodeError::BadMagic));
+    fn slot_status_roundtrips() {
+        let s = SlotStatus { slot: 2, connected: true, bda: [1, 2, 3, 4, 5, 6] };
+        let mut buf = [0u8; SlotStatus::WIRE_LEN];
+        s.encode_into(&mut buf);
+        assert_eq!(SlotStatus::decode(&buf).unwrap(), s);
+    }
 
-        let mut wrong_version = Frame::new(0, 0, Payload::Ping).encode();
-        wrong_version[1] = 99;
+    #[test]
+    fn rejects_foreign_and_oversized() {
+        assert_eq!(Header::decode(&[]), Err(DecodeError::Truncated));
+        assert_eq!(Header::decode(&[0u8; HEADER_LEN]), Err(DecodeError::BadMagic));
+
+        let mut wrong = Header::encode(kind::PING, 0, 0);
+        wrong[1] = 99;
+        assert_eq!(Header::decode(&wrong), Err(DecodeError::VersionMismatch { got: 99 }));
+
+        // A hostile or corrupt length must be refused, not buffered: the dongle
+        // has no allocator and a fixed reassembly buffer.
+        let big = Header::encode(kind::CONFIG, 0, (MAX_PAYLOAD + 1) as u16);
         assert_eq!(
-            Frame::decode(&wrong_version),
-            Err(DecodeError::VersionMismatch { got: 99 })
+            Header::decode(&big),
+            Err(DecodeError::Oversized((MAX_PAYLOAD + 1) as u16))
         );
+    }
 
-        let mut bad_kind = Frame::new(0, 0, Payload::Ping).encode();
-        bad_kind[2] = 77;
-        assert_eq!(Frame::decode(&bad_kind), Err(DecodeError::UnknownKind(77)));
-
-        let mut bad_edge = Frame::new(0, 0, Payload::Enter { edge: Edge::Left, ratio: 0 }).encode();
-        bad_edge[6] = 9;
-        assert_eq!(Frame::decode(&bad_edge), Err(DecodeError::MalformedPayload));
+    #[test]
+    fn a_full_config_payload_fits() {
+        // MAX_SCREENS screens plus the count byte must fit MAX_PAYLOAD, or the
+        // largest legal config could never be sent.
+        assert!(1 + MAX_SCREENS * SCREEN_WIRE_LEN <= MAX_PAYLOAD);
     }
 
     #[test]
@@ -348,15 +405,13 @@ mod tests {
     fn seq_gate_drops_duplicates_and_stragglers() {
         let mut g = SeqGate::new();
         assert!(g.accept(10));
-        assert!(!g.accept(10), "duplicate must be dropped");
-        assert!(!g.accept(9), "straggler must be dropped");
+        assert!(!g.accept(10));
+        assert!(!g.accept(9));
         assert!(g.accept(11));
     }
 
     #[test]
     fn seq_gate_survives_wraparound() {
-        // The whole point of the signed-distance comparison: a naive `>` would
-        // stall the pointer for 32k frames every time the counter wraps.
         let mut g = SeqGate::new();
         assert!(g.accept(u16::MAX - 1));
         assert!(g.accept(u16::MAX));

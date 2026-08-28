@@ -1,0 +1,24 @@
+# Standalone, not a workspace member: this is a no_std staticlib for
+# riscv32imc-unknown-none-elf and must never be swept into a host `cargo build`.
+# That also means it cannot inherit workspace.package, hence the literals.
+[package]
+name = "scurry-ffi"
+description = "C ABI over the scurry layout engine, linked into the dongle firmware"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ananthb/scurry"
+
+[workspace]
+
+[lib]
+name = "scurry_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+scurry-proto = { path = "../scurry-proto", default-features = false }
+scurry-layout = { path = "../scurry-layout", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

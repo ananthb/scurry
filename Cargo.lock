@@ -221,6 +221,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scurry-layout"
+version = "0.1.0"
+dependencies = [
+ "scurry-proto",
+]
+
+[[package]]
 name = "scurry-proto"
 version = "0.1.0"
 

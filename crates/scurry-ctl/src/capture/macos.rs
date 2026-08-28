@@ -34,6 +34,28 @@ extern "C" {
     /// pointer is on a remote screen we stop the local cursor from moving, but
     /// keep receiving deltas.
     fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+}
+
+/// Pin the local cursor while the pointer belongs to another machine.
+///
+/// Called on *every* remote event, not just on the crossing. macOS re-associates
+/// the cursor on its own -- on focus changes and various system events -- so a
+/// one-shot call at handoff quietly stops holding and the local cursor starts
+/// tracking again. Re-asserting per event is cheap and is the only version that
+/// stays put.
+fn hold_cursor() {
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(0);
+    }
+}
+
+fn release_cursor() {
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(1);
+    }
 }
 
 struct Shared {
@@ -166,6 +188,8 @@ pub fn run(layout: Layout, transport: SerialTransport) -> Result<()> {
             }
 
             if REMOTE.load(Ordering::Relaxed) {
+                // Re-assert every event; see hold_cursor().
+                hold_cursor();
                 None // swallow: this input belongs to another machine
             } else {
                 Some(event.clone())
@@ -196,10 +220,20 @@ pub fn run(layout: Layout, transport: SerialTransport) -> Result<()> {
 
 fn set_remote(remote: bool) {
     let was = REMOTE.swap(remote, Ordering::Relaxed);
-    if was != remote {
-        // Decouple the cursor while remote so it stops travelling on this
-        // display, while the device keeps producing deltas for us to forward.
-        unsafe { CGAssociateMouseAndMouseCursorPosition(i32::from(!remote)) };
+    if was == remote {
+        return;
+    }
+    unsafe {
+        if remote {
+            hold_cursor();
+            // Hide it as well. Decoupling stops the cursor moving but leaves it
+            // sitting on screen, which reads as a frozen Mac rather than as
+            // input having gone elsewhere.
+            CGDisplayHideCursor(CGMainDisplayID());
+        } else {
+            release_cursor();
+            CGDisplayShowCursor(CGMainDisplayID());
+        }
     }
 }
 
