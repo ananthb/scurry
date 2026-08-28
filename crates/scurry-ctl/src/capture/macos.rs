@@ -14,11 +14,12 @@
 //! it stops moving and position-based capture would report nothing, but the
 //! deltas keep coming because the mouse is still physically moving.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
@@ -45,7 +46,14 @@ extern "C" {
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+    fn CGEventTapEnable(port: *mut core::ffi::c_void, enable: bool);
 }
+
+/// The tap's mach port, so the callback can re-enable itself.
+///
+/// Needed because the closure is built before the tap exists, so it cannot
+/// capture it. Set once, immediately after creation.
+static TAP_PORT: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Where the local cursor is parked while input belongs to another machine.
 ///
@@ -237,7 +245,18 @@ pub fn run(dongle: Dongle) -> Result<()> {
                 event_type,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
-                eprintln!("event tap disabled by the system; re-enabling");
+                // Actually re-enable it. Logging alone left the tap dead: every
+                // subsequent event passed through untouched, so input stopped
+                // reaching the target and started acting on this machine again.
+                // That is what the intermittent jank and the stray scrolling
+                // were.
+                let port = TAP_PORT.load(Ordering::Relaxed);
+                if !port.is_null() {
+                    unsafe { CGEventTapEnable(port, true) };
+                    eprintln!("event tap was disabled by the system; re-enabled");
+                } else {
+                    eprintln!("event tap disabled and no port to re-enable it with");
+                }
                 return Some(event.clone());
             }
 
@@ -311,6 +330,10 @@ pub fn run(dongle: Dongle) -> Result<()> {
     })?;
 
     unsafe {
+        TAP_PORT.store(
+            tap.mach_port.as_concrete_TypeRef() as *mut core::ffi::c_void,
+            Ordering::Relaxed,
+        );
         let source = tap
             .mach_port
             .create_runloop_source(0)

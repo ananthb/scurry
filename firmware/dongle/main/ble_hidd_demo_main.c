@@ -28,6 +28,8 @@
 #include "hid_dev.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_mac.h"
+#include "nvs.h"
+#include "scurry_ffi.h"
 
 /**
  * Brief:
@@ -73,6 +75,18 @@ static int scurry_conn_count(void)
     return n;
 }
 
+/* Recompute which nodes the layout may route to. Node ids are slot + 1. */
+static void scurry_publish_available(void)
+{
+    uint32_t mask = 1; /* node 0, the controller's own screen, always */
+    for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
+        if (scurry_conn_used[i]) {
+            mask |= 1u << (i + 1);
+        }
+    }
+    scurry_layout_set_available(mask);
+}
+
 static void scurry_conn_add(uint16_t conn_id, esp_bd_addr_t bda)
 {
     for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
@@ -80,6 +94,7 @@ static void scurry_conn_add(uint16_t conn_id, esp_bd_addr_t bda)
             scurry_conn_used[i] = true;
             scurry_conns[i] = conn_id;
             memcpy(scurry_conn_bda[i], bda, sizeof(esp_bd_addr_t));
+            scurry_publish_available();
             return;
         }
     }
@@ -92,6 +107,7 @@ static void scurry_conn_remove(esp_bd_addr_t bda)
         if (scurry_conn_used[i] &&
             memcmp(scurry_conn_bda[i], bda, sizeof(esp_bd_addr_t)) == 0) {
             scurry_conn_used[i] = false;
+            scurry_publish_available();
             return;
         }
     }
@@ -284,8 +300,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
  * and the host resynchronises on the magic byte.
  * ------------------------------------------------------------------------- */
 
-#include "scurry_ffi.h"
-#include "nvs.h"
 
 #define SCURRY_MAGIC        0x53
 #define SCURRY_VERSION      2
@@ -394,6 +408,21 @@ static esp_err_t scurry_nvs_save(const uint8_t *buf, size_t len)
     if (err != ESP_OK) {
         return err;
     }
+
+    /* Skip the write if nothing changed. Flash endurance is not a real concern
+       at human rates -- a 67-byte blob across a 24KB wear-levelled partition is
+       millions of writes -- but anything that ends up storing per-frame, such
+       as a calibration loop, would chew through it. Comparing first costs a
+       read and removes the whole class of problem. */
+    uint8_t existing[SCURRY_MAX_PAYLOAD];
+    size_t existing_len = sizeof(existing);
+    if (nvs_get_blob(h, SCURRY_NVS_KEY_LAYOUT, existing, &existing_len) == ESP_OK &&
+        existing_len == len && memcmp(existing, buf, len) == 0) {
+        nvs_close(h);
+        ESP_LOGI(HID_DEMO_TAG, "scurry: layout unchanged, not rewriting");
+        return ESP_OK;
+    }
+
     err = nvs_set_blob(h, SCURRY_NVS_KEY_LAYOUT, buf, len);
     if (err == ESP_OK) {
         err = nvs_commit(h);
@@ -426,6 +455,8 @@ static void scurry_nvs_load(void)
         return;
     }
     ESP_LOGI(HID_DEMO_TAG, "scurry: layout restored from NVS (%u bytes)", (unsigned)len);
+    /* Nothing is connected yet at boot; the layout must not route anywhere. */
+    scurry_publish_available();
 }
 
 /* Map a scurry node id onto a live BLE connection. Node 0 is the controller's

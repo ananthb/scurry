@@ -180,6 +180,11 @@ pub struct Layout {
     current: usize,
     x: i32,
     y: i32,
+    /// Bit N set means node N can currently receive input. The pointer refuses
+    /// to cross onto a screen whose machine is not connected, because there is
+    /// nothing there to move: it would look like the pointer had stuck to an
+    /// edge and stopped responding.
+    available: u32,
 }
 
 impl Layout {
@@ -218,7 +223,26 @@ impl Layout {
             screens[local].x + screens[local].width / 2,
             screens[local].y + screens[local].height / 2,
         );
-        Ok(Self { screens: buf, count: screens.len(), current: local, x, y })
+        Ok(Self {
+            screens: buf,
+            count: screens.len(),
+            current: local,
+            x,
+            y,
+            // Optimistic until told otherwise, so a layout works before anyone
+            // reports connection state.
+            available: u32::MAX,
+        })
+    }
+
+    /// Declare which nodes can receive input. Node 0 is the local screen and is
+    /// always available regardless of the mask.
+    pub fn set_available(&mut self, mask: u32) {
+        self.available = mask | 1;
+    }
+
+    fn is_available(&self, node: u8) -> bool {
+        node == Screen::LOCAL || (self.available & (1u32 << (node as u32 & 31))) != 0
     }
 
     pub fn screens(&self) -> &[Screen] {
@@ -250,7 +274,10 @@ impl Layout {
             return Motion::Stayed { node: from, x: nx, y: ny };
         }
 
-        if let Some(idx) = self.screens[..self.count].iter().position(|s| s.contains(nx, ny)) {
+        if let Some(idx) = self.screens[..self.count]
+            .iter()
+            .position(|s| s.contains(nx, ny) && self.is_available(s.node))
+        {
             // Which edge of the destination did we come in through? Derive it
             // from the direction of travel rather than from geometry, so a
             // diagonal flick into a corner picks the dominant axis instead of
@@ -409,6 +436,33 @@ mod tests {
         let mut l = pair();
         assert_eq!(l.advance(-9999, 0), Motion::Stayed { node: 0, x: 0, y: 500 });
         assert!(l.is_local(), "must not fall off the edge of the world");
+    }
+
+    #[test]
+    fn does_not_cross_onto_a_disconnected_machine() {
+        // Crossing to a machine that cannot receive input looks like the
+        // pointer sticking to an edge and going dead. Clamp instead, exactly as
+        // if the screen were not there.
+        let mut l = pair();
+        l.set_available(0); // nothing but the local screen
+        assert_eq!(l.advance(600, 0), Motion::Stayed { node: 0, x: 999, y: 500 });
+        assert!(l.is_local());
+
+        // And crosses again once that machine connects.
+        l.set_available(1 << 1);
+        assert!(matches!(l.advance(600, 0), Motion::Crossed { to: 1, .. }));
+    }
+
+    #[test]
+    fn the_local_screen_is_always_available() {
+        // Even with an empty mask the pointer must be able to come home, or a
+        // dropped connection would strand input on a machine that is gone.
+        let mut l = pair();
+        l.advance(600, 0);
+        assert!(!l.is_local());
+        l.set_available(0);
+        assert!(matches!(l.advance(-600, 0), Motion::Crossed { to: 0, .. }));
+        assert!(l.is_local());
     }
 
     #[test]

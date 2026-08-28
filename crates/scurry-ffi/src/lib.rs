@@ -135,6 +135,23 @@ pub unsafe extern "C" fn scurry_layout_save(out: *mut u8, cap: usize) -> i32 {
     need as i32
 }
 
+/// Declare which nodes can currently receive input, as a bitmask where bit N
+/// means node N. Node 0 is always available regardless.
+///
+/// Without this the pointer crosses onto machines that are not connected, which
+/// presents as the pointer sticking to a screen edge and going dead.
+///
+/// # Safety
+/// Safe to call at any time; takes effect on the next advance.
+#[no_mangle]
+pub extern "C" fn scurry_layout_set_available(mask: u32) {
+    unsafe {
+        if let Some(l) = &mut *core::ptr::addr_of_mut!(LAYOUT) {
+            l.set_available(mask);
+        }
+    }
+}
+
 /// True once a layout has been installed. Until then the dongle has nowhere to
 /// route input and should drop it rather than guess.
 #[no_mangle]

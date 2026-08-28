@@ -37,6 +37,11 @@ int32_t scurry_layout_load(const uint8_t *data, size_t len);
    Returns bytes written, or negative on error. */
 int32_t scurry_layout_save(uint8_t *out, size_t cap);
 
+/* Declare which nodes can receive input, as a bitmask where bit N means node N.
+   Node 0 is always available. Without this the pointer crosses onto machines
+   that are not connected, which looks like it sticking to an edge and dying. */
+void scurry_layout_set_available(uint32_t mask);
+
 /* 0 until a layout is installed. Until then there is nowhere to route input. */
 uint8_t scurry_layout_ready(void);
 
