@@ -37,18 +37,19 @@ the target applies its own keymap on top.
 | `scurry-proto` wire format | done, tested, `no_std` verified on riscv32imc |
 | `scurry-ctl` layout engine | done, tested |
 | `scurry-ctl` input capture | not started |
-| dongle BLE HID firmware | spike in progress |
+| dongle BLE HID firmware | spike passed: 2 bonded hosts held concurrently |
 
 ### The spike
 
 The architecture rests on one unverified claim: that a single ESP32-C3 can hold
 **concurrent bonded HID connections** to several hosts at once.
 
-If it can, switching machines is just choosing which connection handle to write
-to, and handoff is instant. If it cannot, every edge crossing costs a BLE
-reconnect — 200ms to 2s — and this design is not worth building. `firmware/dongle`
-exists to answer that, and to measure what connection interval hosts actually
-grant.
+**It can.** Two machines held simultaneous bonded HID connections on a C3, with
+no disconnect when the second arrived. See `doc/spike-results.md`. Switching is
+therefore a choice of `conn_id`, not a reconnect, and the dongle role needs no
+S3.
+
+Latency remains unmeasured, and that is the design's known weak point.
 
 ## Hardware
 
