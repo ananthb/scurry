@@ -270,32 +270,55 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 }
 
 /* ---------------------------------------------------------------------------
- * scurry frame reader
+ * scurry protocol v2
  *
- * The controller writes 16-byte scurry frames at us over USB Serial/JTAG. This
- * is the SECOND implementation of that wire format -- crates/scurry-proto is
- * the first, in Rust. They must not drift. doc/protocol.md is the normative
- * description; golden vectors in the Rust crate's tests pin the byte layout.
+ * 8-byte header then a length-prefixed payload. The controller sends *raw*
+ * pointer motion and has no opinion about which machine it lands on -- routing
+ * happens here, through the Rust layout engine in scurry-ffi, so the same
+ * tested code runs whether or not a controller exists at all.
  *
- * Logs flow the other way on the same CDC pipe. That is fine: it is full
- * duplex, the host writes binary and reads text.
+ * The wire format is defined in crates/scurry-proto and described in
+ * doc/protocol.md. This file must not drift from it.
+ *
+ * Logs share the pipe in the other direction. That is fine -- it is full duplex,
+ * and the host resynchronises on the magic byte.
  * ------------------------------------------------------------------------- */
 
-#define SCURRY_MAGIC        0x53
-#define SCURRY_VERSION      1
-#define SCURRY_FRAME_LEN    16
+#include "scurry_ffi.h"
+#include "nvs.h"
 
-#define SCURRY_KIND_MOUSE   1
-#define SCURRY_KIND_ENTER   2
-#define SCURRY_KIND_LEAVE   3
-#define SCURRY_KIND_PING    4
-#define SCURRY_KIND_PONG    5
+#define SCURRY_MAGIC        0x53
+#define SCURRY_VERSION      2
+#define SCURRY_HEADER_LEN   8
+#define SCURRY_MAX_PAYLOAD  256
+
+#define SCURRY_KIND_MOUSE       0x01
+#define SCURRY_KIND_PING        0x04
+#define SCURRY_KIND_PONG        0x05
+#define SCURRY_KIND_FOCUS       0x06
+#define SCURRY_KIND_GET_CONFIG  0x10
+#define SCURRY_KIND_CONFIG      0x11
+#define SCURRY_KIND_SET_CONFIG  0x12
+#define SCURRY_KIND_GET_STATUS  0x13
+#define SCURRY_KIND_STATUS      0x14
+#define SCURRY_KIND_ACK         0x15
+
+#define SCURRY_ACK_OK              0
+#define SCURRY_ACK_BAD_REQUEST     1
+#define SCURRY_ACK_INVALID_LAYOUT  2
+#define SCURRY_ACK_STORAGE_FAILED  3
+
+#define SCURRY_NVS_NAMESPACE  "scurry"
+#define SCURRY_NVS_KEY_LAYOUT "layout"
+
+static uint16_t scurry_tx_seq = 0;
+static uint8_t  scurry_focus_node = 0;
 
 static bool     scurry_seq_seen = false;
 static uint16_t scurry_seq_last = 0;
 
 /* Sequence numbers wrap at u16, so "newer" is signed distance on the wrapped
-   circle, not `>`. A naive comparison would stall the pointer for 32k frames
+   circle, not `>`. A naive comparison would stall the stream for 32k messages
    every time the counter wrapped. Mirrors SeqGate in scurry-proto. */
 static bool scurry_seq_accept(uint16_t seq)
 {
@@ -304,21 +327,94 @@ static bool scurry_seq_accept(uint16_t seq)
         scurry_seq_last = seq;
         return true;
     }
-    int16_t delta = (int16_t)(seq - scurry_seq_last);
-    if (delta > 0) {
+    if ((int16_t)(seq - scurry_seq_last) > 0) {
         scurry_seq_last = seq;
         return true;
     }
     return false;
 }
 
-/* Map a scurry node id onto a live BLE connection. Node ids index the
-   connection table in bond order; -1 means that target is not connected. */
+static void scurry_send(uint8_t kind, const uint8_t *payload, uint16_t len)
+{
+    uint8_t header[SCURRY_HEADER_LEN] = {0};
+    header[0] = SCURRY_MAGIC;
+    header[1] = SCURRY_VERSION;
+    header[2] = kind;
+    header[4] = (uint8_t)(scurry_tx_seq & 0xFF);
+    header[5] = (uint8_t)(scurry_tx_seq >> 8);
+    header[6] = (uint8_t)(len & 0xFF);
+    header[7] = (uint8_t)(len >> 8);
+    scurry_tx_seq++;
+
+    usb_serial_jtag_write_bytes(header, sizeof(header), 100 / portTICK_PERIOD_MS);
+    if (len > 0 && payload != NULL) {
+        usb_serial_jtag_write_bytes(payload, len, 100 / portTICK_PERIOD_MS);
+    }
+}
+
+static void scurry_send_ack(uint8_t code)
+{
+    scurry_send(SCURRY_KIND_ACK, &code, 1);
+}
+
+/* Tell the controller where the pointer went. Without this it cannot know
+   whether to swallow local input, because it no longer owns the layout. */
+static void scurry_announce_focus(uint8_t node)
+{
+    if (node == scurry_focus_node) {
+        return;
+    }
+    scurry_focus_node = node;
+    scurry_send(SCURRY_KIND_FOCUS, &node, 1);
+    ESP_LOGI(HID_DEMO_TAG, "scurry: focus -> node %d", node);
+}
+
+static esp_err_t scurry_nvs_save(const uint8_t *buf, size_t len)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SCURRY_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(h, SCURRY_NVS_KEY_LAYOUT, buf, len);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+/* Restore the stored layout at boot. Absent storage is not an error: a dongle
+   that has never been configured simply has nowhere to route yet, and says so
+   rather than inventing a layout. */
+static void scurry_nvs_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SCURRY_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        ESP_LOGI(HID_DEMO_TAG, "scurry: no stored layout yet");
+        return;
+    }
+    uint8_t buf[SCURRY_MAX_PAYLOAD];
+    size_t len = sizeof(buf);
+    esp_err_t err = nvs_get_blob(h, SCURRY_NVS_KEY_LAYOUT, buf, &len);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGI(HID_DEMO_TAG, "scurry: no stored layout yet");
+        return;
+    }
+    int32_t rc = scurry_layout_load(buf, len);
+    if (rc != 0) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: stored layout rejected (%ld)", (long)rc);
+        return;
+    }
+    ESP_LOGI(HID_DEMO_TAG, "scurry: layout restored from NVS (%u bytes)", (unsigned)len);
+}
+
+/* Map a scurry node id onto a live BLE connection. Node 0 is the controller's
+   own screen and is never transmitted, so node N addresses slot N-1. Reserving
+   0 means a zeroed or truncated message cannot address a real target. */
 static int scurry_conn_for_node(uint8_t node)
 {
-    /* Node 0 is the controller's own screen. The controller never transmits
-       it, so node N addresses connection slot N-1. Keeping 0 reserved means a
-       zeroed or truncated frame cannot accidentally address a real target. */
     if (node == 0 || node > SCURRY_MAX_HOSTS) {
         return -1;
     }
@@ -326,43 +422,118 @@ static int scurry_conn_for_node(uint8_t node)
     return scurry_conn_used[slot] ? (int)scurry_conns[slot] : -1;
 }
 
-static void scurry_handle_frame(const uint8_t *f)
+static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
 {
-    uint8_t  kind = f[2];
-    uint8_t  node = f[3];
-    uint16_t seq  = (uint16_t)f[4] | ((uint16_t)f[5] << 8);
+    if (len < 8) {
+        return;
+    }
+    uint8_t buttons = p[0];
+    int16_t dx = (int16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+    int16_t dy = (int16_t)((uint16_t)p[3] | ((uint16_t)p[4] << 8));
+    int8_t  wheel = (int8_t)p[5];
+    int8_t  pan   = (int8_t)p[6];
 
-    if (!scurry_seq_accept(seq)) {
-        return; /* reordered straggler */
+    if (!scurry_layout_ready()) {
+        return; /* nowhere to route: drop rather than guess */
     }
 
-    int conn = scurry_conn_for_node(node);
-    if (conn < 0 && kind != SCURRY_KIND_PING) {
-        return; /* nothing bonded on that slot yet */
+    scurry_route_t route;
+    if (scurry_layout_advance(dx, dy, &route) != 0) {
+        return;
+    }
+
+    if (route.crossed) {
+        /* Release on the machine being left before the pointer arrives
+           anywhere else, or a drag across the boundary strands a held button
+           on a machine the user is no longer sitting at. */
+        int from_conn = scurry_conn_for_node(route.from);
+        if (from_conn >= 0) {
+            esp_hidd_send_mouse_report((uint16_t)from_conn, 0, 0, 0, 0, 0);
+        }
+        scurry_announce_focus(route.to);
+    }
+
+    int conn = scurry_conn_for_node(route.to);
+    if (conn >= 0) {
+        esp_hidd_send_mouse_report((uint16_t)conn, buttons, dx, dy, wheel, pan);
+    }
+}
+
+static void scurry_send_config(void)
+{
+    uint8_t buf[SCURRY_MAX_PAYLOAD];
+    int32_t n = scurry_layout_save(buf, sizeof(buf));
+    if (n < 0) {
+        /* Not configured yet: an empty config is a valid answer, and lets the
+           controller distinguish "none stored" from "link is broken". */
+        uint8_t empty = 0;
+        scurry_send(SCURRY_KIND_CONFIG, &empty, 1);
+        return;
+    }
+    scurry_send(SCURRY_KIND_CONFIG, buf, (uint16_t)n);
+}
+
+static void scurry_send_status(void)
+{
+    uint8_t buf[1 + SCURRY_MAX_HOSTS * 8];
+    buf[0] = SCURRY_MAX_HOSTS;
+    for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
+        uint8_t *e = &buf[1 + i * 8];
+        e[0] = (uint8_t)i;
+        e[1] = scurry_conn_used[i] ? 1 : 0;
+        memcpy(&e[2], scurry_conn_bda[i], 6);
+    }
+    scurry_send(SCURRY_KIND_STATUS, buf, sizeof(buf));
+}
+
+static void scurry_handle_set_config(const uint8_t *p, uint16_t len)
+{
+    /* Validate before storing. scurry_layout_load runs the same checks the
+       controller's tests cover -- overlaps, duplicate nodes, a missing local
+       screen -- so an unusable layout can never reach NVS and brick routing
+       across a reboot. */
+    int32_t rc = scurry_layout_load(p, len);
+    if (rc != 0) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: rejected layout (%ld)", (long)rc);
+        scurry_send_ack(SCURRY_ACK_INVALID_LAYOUT);
+        return;
+    }
+    if (scurry_nvs_save(p, len) != ESP_OK) {
+        scurry_send_ack(SCURRY_ACK_STORAGE_FAILED);
+        return;
+    }
+    ESP_LOGI(HID_DEMO_TAG, "scurry: layout stored (%u bytes)", (unsigned)len);
+    scurry_send_ack(SCURRY_ACK_OK);
+}
+
+static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, uint16_t len)
+{
+    /* Only the pointer stream is sequence-gated. Control messages are rare and
+       must not be dropped for arriving out of order behind a burst of motion. */
+    if (kind == SCURRY_KIND_MOUSE) {
+        if (!scurry_seq_accept(seq)) {
+            return;
+        }
+        scurry_handle_mouse(payload, len);
+        return;
     }
 
     switch (kind) {
-    case SCURRY_KIND_MOUSE: {
-        uint8_t buttons = f[6];
-        int16_t dx = (int16_t)((uint16_t)f[8]  | ((uint16_t)f[9]  << 8));
-        int16_t dy = (int16_t)((uint16_t)f[10] | ((uint16_t)f[11] << 8));
-        int8_t  wheel = (int8_t)f[12];
-        int8_t  pan   = (int8_t)f[13];
-        esp_hidd_send_mouse_report((uint16_t)conn, buttons, dx, dy, wheel, pan);
-        break;
-    }
-    case SCURRY_KIND_LEAVE:
-        /* Release everything. A drag that crosses a screen boundary must not
-           strand a held button on the machine being departed. */
-        esp_hidd_send_mouse_report((uint16_t)conn, 0, 0, 0, 0, 0);
-        break;
-    case SCURRY_KIND_ENTER:
-        ESP_LOGI(HID_DEMO_TAG, "scurry: enter node=%d edge=%d", node, f[6]);
-        break;
     case SCURRY_KIND_PING:
-        ESP_LOGI(HID_DEMO_TAG, "scurry: ping seq=%u, %d host(s)", seq, scurry_conn_count());
+        scurry_send(SCURRY_KIND_PONG, NULL, 0);
+        break;
+    case SCURRY_KIND_GET_CONFIG:
+        scurry_send_config();
+        break;
+    case SCURRY_KIND_SET_CONFIG:
+        scurry_handle_set_config(payload, len);
+        break;
+    case SCURRY_KIND_GET_STATUS:
+        scurry_send_status();
         break;
     default:
+        ESP_LOGD(HID_DEMO_TAG, "scurry: unhandled kind 0x%02x", kind);
+        scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
         break;
     }
 }
@@ -377,9 +548,9 @@ void scurry_reader_task(void *pvParameters)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(HID_DEMO_TAG, "scurry: reading frames from USB Serial/JTAG");
+    ESP_LOGI(HID_DEMO_TAG, "scurry: reading protocol v%d from USB Serial/JTAG", SCURRY_VERSION);
 
-    static uint8_t buf[SCURRY_FRAME_LEN * 8];
+    static uint8_t buf[SCURRY_HEADER_LEN + SCURRY_MAX_PAYLOAD];
     size_t filled = 0;
 
     while (1) {
@@ -391,22 +562,34 @@ void scurry_reader_task(void *pvParameters)
         filled += (size_t)n;
 
         size_t off = 0;
-        while (filled - off >= SCURRY_FRAME_LEN) {
-            /* Resynchronise byte-by-byte on the magic. A dropped or spurious
-               byte otherwise desynchronises the stream permanently. */
-            if (buf[off] != SCURRY_MAGIC || buf[off + 1] != SCURRY_VERSION) {
+        while (filled - off >= SCURRY_HEADER_LEN) {
+            const uint8_t *h = buf + off;
+            /* Resynchronise a byte at a time on the magic. A dropped or
+               spurious byte otherwise desynchronises the stream permanently. */
+            if (h[0] != SCURRY_MAGIC || h[1] != SCURRY_VERSION) {
                 off++;
                 continue;
             }
-            scurry_handle_frame(buf + off);
-            off += SCURRY_FRAME_LEN;
+            uint16_t len = (uint16_t)h[6] | ((uint16_t)h[7] << 8);
+            if (len > SCURRY_MAX_PAYLOAD) {
+                off++; /* corrupt: treat as a false magic rather than trusting it */
+                continue;
+            }
+            if (filled - off < (size_t)SCURRY_HEADER_LEN + len) {
+                break; /* payload still in flight */
+            }
+            uint16_t seq = (uint16_t)h[4] | ((uint16_t)h[5] << 8);
+            scurry_handle(h[2], seq, h + SCURRY_HEADER_LEN, len);
+            off += SCURRY_HEADER_LEN + len;
         }
-        /* Keep the unconsumed tail. */
+
         if (off > 0) {
             memmove(buf, buf + off, filled - off);
             filled -= off;
         } else if (filled == sizeof(buf)) {
-            filled = 0; /* no magic anywhere in a full buffer: drop it */
+            /* A full buffer with no parsable message: drop it rather than
+               deadlock with no room to read more. */
+            filled = 0;
         }
     }
 }
@@ -426,6 +609,10 @@ void app_main(void)
 
     /* Before anything can advertise it. Reads efuse, so it is safe this early. */
     scurry_make_device_name();
+
+    /* NVS is up by now, so the stored layout can be restored before the first
+       pointer message could possibly arrive. */
+    scurry_nvs_load();
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 

@@ -214,6 +214,7 @@ dependencies = [
  "anyhow",
  "core-foundation",
  "core-graphics",
+ "scurry-layout",
  "scurry-proto",
  "serde",
  "serialport",

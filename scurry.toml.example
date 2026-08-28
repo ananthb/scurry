@@ -1,8 +1,12 @@
-# The virtual desktop. Screens are rectangles in one shared coordinate space;
+# The virtual desktop, pushed to the dongle with: scurry-ctl set-config <file>
+#
+# This file is an input, not state. The dongle stores the layout; read it back
+# with: scurry-ctl get-config
+#
+# Screens are rectangles in one shared coordinate space;
 # whichever contains the pointer holds focus. They need not tile the plane --
 # the pointer clamps rather than falling into a gap.
 
-# device = "/dev/cu.usbmodem2101"   # autodetected when omitted
 
 # Node 0 is this machine. Input stays local and is never transmitted.
 [[screen]]

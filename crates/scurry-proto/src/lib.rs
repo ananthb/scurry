@@ -69,6 +69,13 @@ pub mod kind {
     pub const MOUSE: u8 = 0x01;
     pub const PING: u8 = 0x04;
     pub const PONG: u8 = 0x05;
+    /// Dongle -> controller: the pointer now belongs to this node; payload is
+    /// a single node id, 0 meaning the controller's own screen.
+    ///
+    /// Required, not informational. Since the dongle owns the layout, the
+    /// controller cannot otherwise tell whether to swallow local input and hide
+    /// its cursor -- it has no idea where the pointer went.
+    pub const FOCUS: u8 = 0x06;
 
     /// Controller -> dongle: send me the stored layout.
     pub const GET_CONFIG: u8 = 0x10;
@@ -391,6 +398,22 @@ mod tests {
         // MAX_SCREENS screens plus the count byte must fit MAX_PAYLOAD, or the
         // largest legal config could never be sent.
         assert!(1 + MAX_SCREENS * SCREEN_WIRE_LEN <= MAX_PAYLOAD);
+    }
+
+    #[test]
+    fn control_kinds_do_not_collide_with_hot_path() {
+        // The split at 0x10 is load-bearing: a reader tells the classes apart
+        // by magnitude, so an overlap would route a config message into the
+        // pointer path.
+        for k in [kind::MOUSE, kind::PING, kind::PONG, kind::FOCUS] {
+            assert!(k < 0x10, "hot-path kind {k:#x} must stay below 0x10");
+        }
+        for k in [
+            kind::GET_CONFIG, kind::CONFIG, kind::SET_CONFIG,
+            kind::GET_STATUS, kind::STATUS, kind::ACK,
+        ] {
+            assert!(k >= 0x10, "control kind {k:#x} must be 0x10 or above");
+        }
     }
 
     #[test]

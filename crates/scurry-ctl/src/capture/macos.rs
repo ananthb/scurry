@@ -2,21 +2,21 @@
 //!
 //! # Permission
 //!
-//! Creating an event tap that can *modify* events needs Accessibility
-//! permission (System Settings -> Privacy & Security -> Accessibility). Without
-//! it `CGEventTapCreate` returns null and we cannot capture anything. The error
-//! path says so explicitly, because the failure is otherwise inscrutable.
+//! A tap that can *modify* events needs Accessibility permission (System
+//! Settings -> Privacy & Security -> Accessibility). Without it
+//! `CGEventTapCreate` returns null. The error path says so, because the failure
+//! is otherwise inscrutable.
 //!
-//! # Why deltas rather than cursor position
+//! # Deltas, not cursor position
 //!
-//! We read `EventField::MOUSE_EVENT_DELTA_X/Y`, which is device motion, not cursor
-//! position. That distinction is what makes edge handoff work at all: once the
-//! pointer is pinned against the edge of the display, the cursor stops moving
-//! and position-based capture would report nothing, but the deltas keep coming
-//! because the mouse is still physically moving.
+//! We read `MOUSE_EVENT_DELTA_X/Y`, which is device motion. That is what makes
+//! edge handoff work: once the cursor is pinned against the edge of the display
+//! it stops moving and position-based capture would report nothing, but the
+//! deltas keep coming because the mouse is still physically moving.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -24,49 +24,54 @@ use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     EventField,
 };
-use scurry_proto::{button, MouseState, Payload};
+use scurry_proto::{button, kind, MouseState};
 
-use crate::layout::{Layout, Motion};
-use crate::transport::SerialTransport;
+use crate::transport::Dongle;
 
 extern "C" {
-    /// Decouples the hardware mouse from the on-screen cursor. While the
-    /// pointer is on a remote screen we stop the local cursor from moving, but
-    /// keep receiving deltas.
+    /// Decouples the hardware mouse from the on-screen cursor, so the local
+    /// cursor stays put while deltas keep arriving.
     fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
 }
 
+/// Node currently holding the pointer, as last announced by the dongle. 0 is
+/// this machine.
+static FOCUS: AtomicU8 = AtomicU8::new(0);
+/// Mirrors `FOCUS != 0`, so the tap callback can decide without a load-and-compare.
+static REMOTE: AtomicBool = AtomicBool::new(false);
+
 /// Pin the local cursor while the pointer belongs to another machine.
 ///
-/// Called on *every* remote event, not just on the crossing. macOS re-associates
-/// the cursor on its own -- on focus changes and various system events -- so a
-/// one-shot call at handoff quietly stops holding and the local cursor starts
-/// tracking again. Re-asserting per event is cheap and is the only version that
-/// stays put.
+/// Re-asserted on *every* remote event, not just at handoff. macOS re-associates
+/// the cursor on its own -- on focus changes and assorted system events -- so a
+/// one-shot call quietly stops holding and the local cursor starts tracking
+/// again. Re-asserting is cheap and is the only version that stays put.
 fn hold_cursor() {
     unsafe {
         CGAssociateMouseAndMouseCursorPosition(0);
     }
 }
 
-fn release_cursor() {
+fn set_remote(remote: bool) {
+    if REMOTE.swap(remote, Ordering::Relaxed) == remote {
+        return;
+    }
     unsafe {
-        CGAssociateMouseAndMouseCursorPosition(1);
+        if remote {
+            hold_cursor();
+            // Hide it too. Decoupling stops the cursor moving but leaves it on
+            // screen, which reads as a frozen Mac rather than as input having
+            // gone elsewhere.
+            CGDisplayHideCursor(CGMainDisplayID());
+        } else {
+            CGAssociateMouseAndMouseCursorPosition(1);
+            CGDisplayShowCursor(CGMainDisplayID());
+        }
     }
 }
-
-struct Shared {
-    layout: Layout,
-    transport: SerialTransport,
-    buttons: u8,
-}
-
-/// Set while the pointer is on a remote screen, so the tap callback can decide
-/// whether to swallow the event without taking the lock first.
-static REMOTE: AtomicBool = AtomicBool::new(false);
 
 fn button_bit(event_type: CGEventType, event: &CGEvent) -> Option<u8> {
     Some(match event_type {
@@ -91,9 +96,43 @@ fn is_press(event_type: CGEventType) -> bool {
     )
 }
 
-/// Capture local mouse input and route it across `layout` forever.
-pub fn run(layout: Layout, transport: SerialTransport) -> Result<()> {
-    let shared = Mutex::new(Shared { layout, transport, buttons: 0 });
+fn clamp_i8(v: i64) -> i8 {
+    v.clamp(i8::MIN as i64, i8::MAX as i64) as i8
+}
+
+fn clamp_i16(v: i64) -> i16 {
+    v.clamp(i16::MIN as i64, i16::MAX as i64) as i16
+}
+
+/// Capture local input and forward it to the dongle, forever.
+pub fn run(dongle: Dongle) -> Result<()> {
+    // The dongle owns the layout, so it must tell us where the pointer went;
+    // we cannot work it out. A reader thread applies those announcements and
+    // surfaces the firmware's log output, which shares this pipe.
+    let reader = dongle.try_clone()?;
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut on_log = |line: &str| eprintln!("[dongle] {line}");
+        loop {
+            match reader.recv(Duration::from_millis(200), &mut on_log) {
+                Ok(Some(msg)) if msg.kind == kind::FOCUS => {
+                    if let Some(&node) = msg.payload.first() {
+                        FOCUS.store(node, Ordering::Relaxed);
+                        set_remote(node != 0);
+                        eprintln!("focus -> node {node}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("dongle read error: {e}");
+                    return;
+                }
+            }
+        }
+    });
+
+    let shared = Arc::new(Mutex::new((dongle, 0u8))); // (link, button state)
+    let tap_state = Arc::clone(&shared);
 
     let events = vec![
         CGEventType::MouseMoved,
@@ -113,83 +152,59 @@ pub fn run(layout: Layout, transport: SerialTransport) -> Result<()> {
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         // Default, not ListenOnly: we must be able to swallow events once the
-        // pointer is on another machine, or every remote movement would also
-        // move the local cursor.
+        // pointer is on another machine, or remote movement would drag the
+        // local cursor along with it.
         CGEventTapOptions::Default,
         events,
         move |_proxy, event_type, event| {
-            // macOS disables a tap that takes too long to respond, and silently
-            // stops delivering events until it is re-enabled. Handling this is
-            // not optional: without it capture dies under load and looks like a
-            // hang.
+            // macOS disables a tap that responds too slowly and silently stops
+            // delivering events until it is re-enabled. Handling this is not
+            // optional: without it capture dies under load and looks like a hang.
             if matches!(
                 event_type,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
-                log_reenable();
+                eprintln!("event tap disabled by the system; re-enabling");
                 return Some(event.clone());
             }
 
-            let mut s = match shared.lock() {
-                Ok(s) => s,
+            let mut guard = match tap_state.lock() {
+                Ok(g) => g,
                 Err(_) => return Some(event.clone()),
             };
+            let (dongle, buttons) = &mut *guard;
 
-            let mut wheel = 0i8;
-            let mut pan = 0i8;
-            let (mut dx, mut dy) = (0i32, 0i32);
-
+            let mut state = MouseState::default();
             match event_type {
                 CGEventType::ScrollWheel => {
-                    wheel = clamp_i8(event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1));
-                    pan = clamp_i8(event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2));
+                    state.wheel = clamp_i8(
+                        event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+                    );
+                    state.pan = clamp_i8(
+                        event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
+                    );
                 }
                 _ => {
-                    dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32;
-                    dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32;
+                    state.dx =
+                        clamp_i16(event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X));
+                    state.dy =
+                        clamp_i16(event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y));
                     if let Some(bit) = button_bit(event_type, event) {
                         if is_press(event_type) {
-                            s.buttons |= bit;
+                            *buttons |= bit;
                         } else {
-                            s.buttons &= !bit;
+                            *buttons &= !bit;
                         }
                     }
                 }
             }
+            state.buttons = *buttons;
 
-            let motion = s.layout.advance(dx, dy);
-            let buttons = s.buttons;
-
-            match motion {
-                Motion::Crossed { from, to, edge, ratio, .. } => {
-                    // Order matters. Release on the machine being left before
-                    // announcing arrival, or a drag across the boundary strands
-                    // a held button on the departed machine.
-                    if from != crate::layout::Screen::LOCAL {
-                        let _ = s.transport.send_to(from, Payload::Leave);
-                    }
-                    if to != crate::layout::Screen::LOCAL {
-                        let _ = s.transport.send_to(to, Payload::Enter { edge, ratio });
-                    }
-                    set_remote(to != crate::layout::Screen::LOCAL);
-                }
-                Motion::Stayed { node, .. } => {
-                    if node != crate::layout::Screen::LOCAL {
-                        let st = MouseState {
-                            buttons,
-                            dx: clamp_i16(dx),
-                            dy: clamp_i16(dy),
-                            wheel,
-                            pan,
-                        };
-                        let _ = s.transport.send_to(node, Payload::Mouse(st));
-                    }
-                }
-            }
+            let _ = dongle.send(kind::MOUSE, &state.encode());
+            drop(guard);
 
             if REMOTE.load(Ordering::Relaxed) {
-                // Re-assert every event; see hold_cursor().
-                hold_cursor();
+                hold_cursor(); // re-assert; see hold_cursor()
                 None // swallow: this input belongs to another machine
             } else {
                 Some(event.clone())
@@ -216,35 +231,4 @@ pub fn run(layout: Layout, transport: SerialTransport) -> Result<()> {
         CFRunLoop::run_current();
     }
     Ok(())
-}
-
-fn set_remote(remote: bool) {
-    let was = REMOTE.swap(remote, Ordering::Relaxed);
-    if was == remote {
-        return;
-    }
-    unsafe {
-        if remote {
-            hold_cursor();
-            // Hide it as well. Decoupling stops the cursor moving but leaves it
-            // sitting on screen, which reads as a frozen Mac rather than as
-            // input having gone elsewhere.
-            CGDisplayHideCursor(CGMainDisplayID());
-        } else {
-            release_cursor();
-            CGDisplayShowCursor(CGMainDisplayID());
-        }
-    }
-}
-
-fn log_reenable() {
-    eprintln!("event tap was disabled by the system; re-enabling");
-}
-
-fn clamp_i8(v: i64) -> i8 {
-    v.clamp(i8::MIN as i64, i8::MAX as i64) as i8
-}
-
-fn clamp_i16(v: i32) -> i16 {
-    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }

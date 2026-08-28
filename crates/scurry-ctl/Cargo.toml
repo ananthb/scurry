@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 scurry-proto.workspace = true
+scurry-layout.workspace = true
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
