@@ -295,24 +295,43 @@ impl Header {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SeqGate {
     last: Option<u16>,
+    rejected: u8,
 }
+
+/// Consecutive rejections after which the gate re-anchors.
+///
+/// A restarted controller begins counting from zero again, while the receiver
+/// still remembers a high sequence from the previous session -- so every
+/// message looks like an ancient straggler and input dies silently until the
+/// counter climbs back past the old value, which can take thousands of
+/// messages. Real reordering is a handful of messages at most, so a sustained
+/// run of rejects means the peer restarted, not that the network is confused.
+pub const SEQ_RESYNC_AFTER: u8 = 8;
 
 impl SeqGate {
     pub fn new() -> Self {
-        Self { last: None }
+        Self { last: None, rejected: 0 }
     }
 
     pub fn accept(&mut self, seq: u16) -> bool {
         match self.last {
             None => {
                 self.last = Some(seq);
+                self.rejected = 0;
                 true
             }
             Some(prev) => {
                 if (seq.wrapping_sub(prev) as i16) > 0 {
                     self.last = Some(seq);
+                    self.rejected = 0;
+                    true
+                } else if self.rejected >= SEQ_RESYNC_AFTER {
+                    // The peer restarted; re-anchor on its new numbering.
+                    self.last = Some(seq);
+                    self.rejected = 0;
                     true
                 } else {
+                    self.rejected += 1;
                     false
                 }
             }
@@ -431,6 +450,39 @@ mod tests {
         assert!(!g.accept(10));
         assert!(!g.accept(9));
         assert!(g.accept(11));
+    }
+
+    #[test]
+    fn seq_gate_reanchors_when_the_peer_restarts() {
+        // The bug: a restarted controller counts from 0 while the receiver
+        // remembers thousands, so every message is dropped as a straggler and
+        // input dies silently. Observed as 320 motion messages producing
+        // nothing at all.
+        let mut g = SeqGate::new();
+        for s in 0..5000u16 {
+            g.accept(s);
+        }
+        let restarted: Vec<bool> = (0..20u16).map(|s| g.accept(s)).collect();
+        assert!(
+            restarted[..SEQ_RESYNC_AFTER as usize].iter().all(|&a| !a),
+            "a short burst of stragglers must still be rejected"
+        );
+        assert!(
+            restarted[SEQ_RESYNC_AFTER as usize..].iter().all(|&a| a),
+            "a sustained run means the peer restarted; re-anchor"
+        );
+    }
+
+    #[test]
+    fn brief_reordering_still_drops() {
+        // Re-anchoring must not defeat the gate's actual purpose.
+        let mut g = SeqGate::new();
+        for s in 0..100u16 {
+            g.accept(s);
+        }
+        assert!(!g.accept(97), "a straggler is still a straggler");
+        assert!(!g.accept(98));
+        assert!(g.accept(101), "and progress still gets through");
     }
 
     #[test]

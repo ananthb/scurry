@@ -21,6 +21,7 @@ commands:
   get-config          print the layout stored on the dongle, as TOML
   set-config <file>   store a TOML layout on the dongle
   ping                check the link
+  test-move           drive synthetic motion, printing everything the dongle says
 
 All configuration lives on the dongle. Nothing is stored locally, so a layout
 survives moving to another controller machine."
@@ -37,6 +38,7 @@ fn main() -> Result<()> {
         "get-config" => get_config(),
         "set-config" => set_config(args.get(1).map(String::as_str).unwrap_or_else(|| usage())),
         "ping" => ping(),
+        "test-move" => test_move(),
         _ => usage(),
     }
 }
@@ -102,6 +104,43 @@ fn ping() -> Result<()> {
     let mut d = open()?;
     request(&mut d, kind::PING, &[], kind::PONG)?;
     println!("dongle responded");
+    Ok(())
+}
+
+/// Drive the pointer with synthetic motion and print every reply.
+///
+/// Exists to exercise the dongle without an event tap, so the pointer path can
+/// be tested without hijacking the real mouse -- and so the dongle's own log
+/// output is visible while it happens.
+fn test_move() -> Result<()> {
+    use scurry_proto::MouseState;
+    let mut d = open()?;
+    let mut on_log = |line: &str| eprintln!("[dongle] {line}");
+
+    eprintln!("sweeping right, then back left");
+    for (label, dx) in [("right", 12i16), ("left", -12i16)] {
+        eprintln!("--- {label} ---");
+        for _ in 0..160 {
+            let st = MouseState { buttons: 0, dx, dy: 0, wheel: 0, pan: 0 };
+            d.send(kind::MOUSE, &st.encode())?;
+            std::thread::sleep(Duration::from_millis(8));
+            while let Some(m) = d.recv(Duration::from_millis(1), &mut on_log)? {
+                match m.kind {
+                    kind::FOCUS => eprintln!("FOCUS -> node {}", m.payload.first().copied().unwrap_or(255)),
+                    k => eprintln!("message kind {k:#04x}, {} bytes", m.payload.len()),
+                }
+            }
+        }
+    }
+    // Drain whatever is still in flight.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if let Some(m) = d.recv(Duration::from_millis(100), &mut on_log)? {
+            if m.kind == kind::FOCUS {
+                eprintln!("FOCUS -> node {}", m.payload.first().copied().unwrap_or(255));
+            }
+        }
+    }
     Ok(())
 }
 

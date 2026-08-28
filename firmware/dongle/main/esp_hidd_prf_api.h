@@ -160,10 +160,10 @@ void esp_hidd_send_consumer_value(uint16_t conn_id, uint8_t key_cmd, bool key_pr
 
 void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask, uint8_t *keyboard_cmd, uint8_t num_key);
 
-/* X and Y are ABSOLUTE, normalised to 0..32767 across the target's screen.
-   Wheel and pan stay relative, which is what scrolling means. */
+/* Relative deltas. 16-bit rather than the boot protocol's 8: at 8 bits a fast
+   flick saturates at 127 units per report and the pointer lags the hand. */
 void esp_hidd_send_mouse_report(uint16_t conn_id, uint8_t buttons,
-                                uint16_t x, uint16_t y, int8_t wheel, int8_t pan);
+                                int16_t dx, int16_t dy, int8_t wheel, int8_t pan);
 
 #ifdef __cplusplus
 }

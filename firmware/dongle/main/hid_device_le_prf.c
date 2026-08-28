@@ -49,16 +49,18 @@ static const uint8_t hidReportMap[] = {
     0x05, 0x01,        //     Usage Page (Generic Desktop)
     0x09, 0x30,        //     Usage (X)
     0x09, 0x31,        //     Usage (Y)
-    0x15, 0x00,        //     Logical Minimum (0)
+    0x16, 0x01, 0x80,  //     Logical Minimum (-32767)
     0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
     0x75, 0x10,        //     Report Size (16)
     0x95, 0x02,        //     Report Count (2)
-    /* ABSOLUTE, not relative. Relative motion needs dead reckoning -- the
-       dongle assuming its model of the remote pointer matches reality -- and
-       that breaks the moment anything else moves the pointer, or as soon as the
-       target applies its own acceleration to our deltas. The dongle owns the
-       layout, so it knows exactly where the pointer belongs and says so. */
-    0x81, 0x02,        //     Input (Data, Variable, Absolute) - X, Y
+    /* Relative. Absolute axes are cleaner in principle -- no dead reckoning to
+       drift -- but ChromeOS silently ignores an absolute-axis Mouse collection:
+       the cursor simply never appears. Android behaves the same way. Absolute
+       pointing there needs a Digitizer, which brings its own problems (treated
+       as a stylus, no hover, odd multi-display behaviour).
+       Dead reckoning is instead re-anchored on every crossing; see the slam in
+       scurry_handle_mouse(). */
+    0x81, 0x06,        //     Input (Data, Variable, Relative) - X, Y
     0x09, 0x38,        //     Usage (Wheel)
     0x15, 0x81,        //     Logical Minimum (-127)
     0x25, 0x7F,        //     Logical Maximum (127)

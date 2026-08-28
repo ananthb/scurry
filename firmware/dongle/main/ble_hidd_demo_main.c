@@ -316,6 +316,15 @@ static uint8_t  scurry_focus_node = 0;
 
 static bool     scurry_seq_seen = false;
 static uint16_t scurry_seq_last = 0;
+static uint8_t  scurry_seq_rejected = 0;
+
+/* Consecutive rejections after which the gate re-anchors. A restarted
+   controller counts from zero again while we still remember a high sequence
+   from the previous session, so every message looks like an ancient straggler
+   and input dies silently until the counter climbs past the old value --
+   thousands of messages later. Real reordering is a handful at most, so a
+   sustained run of rejects means the peer restarted. */
+#define SCURRY_SEQ_RESYNC_AFTER 8
 
 /* Sequence numbers wrap at u16, so "newer" is signed distance on the wrapped
    circle, not `>`. A naive comparison would stall the stream for 32k messages
@@ -325,12 +334,21 @@ static bool scurry_seq_accept(uint16_t seq)
     if (!scurry_seq_seen) {
         scurry_seq_seen = true;
         scurry_seq_last = seq;
+        scurry_seq_rejected = 0;
         return true;
     }
     if ((int16_t)(seq - scurry_seq_last) > 0) {
         scurry_seq_last = seq;
+        scurry_seq_rejected = 0;
         return true;
     }
+    if (scurry_seq_rejected >= SCURRY_SEQ_RESYNC_AFTER) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: controller restarted, re-anchoring at seq %u", seq);
+        scurry_seq_last = seq;
+        scurry_seq_rejected = 0;
+        return true;
+    }
+    scurry_seq_rejected++;
     return false;
 }
 
@@ -447,14 +465,35 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
     if (route.crossed) {
         /* Release on the machine being left before the pointer arrives
            anywhere else, or a drag across the boundary strands a held button
-           on a machine the user is no longer sitting at. Position is held at
-           whatever it was; only the buttons are cleared. */
+           on a machine the user is no longer sitting at. */
         int from_conn = scurry_conn_for_node(route.from);
         if (from_conn >= 0) {
-            esp_hidd_send_mouse_report((uint16_t)from_conn, 0,
-                                       route.abs_x, route.abs_y, 0, 0);
+            esp_hidd_send_mouse_report((uint16_t)from_conn, 0, 0, 0, 0, 0);
         }
         scurry_announce_focus(route.to);
+
+        /* Re-anchor. With relative motion the dongle is dead reckoning, and its
+           model drifts: the target applies its own pointer acceleration to our
+           deltas, and anything else touching that machine moves the pointer
+           without telling us. Slamming hard against the arrival edge pins the
+           pointer somewhere known -- the target clamps at its own boundary --
+           so every crossing starts from a fixed reference instead of
+           accumulating error forever. */
+        int to_conn = scurry_conn_for_node(route.to);
+        if (to_conn >= 0) {
+            int16_t sx = 0, sy = 0;
+            switch (route.edge) {
+            case 0: sx = -20000; break;  /* arriving at the left edge   */
+            case 1: sx =  20000; break;  /* ... right                   */
+            case 2: sy = -20000; break;  /* ... top                     */
+            default: sy = 20000; break;  /* ... bottom                  */
+            }
+            for (int i = 0; i < 3; i++) {
+                esp_hidd_send_mouse_report((uint16_t)to_conn, 0, sx, sy, 0, 0);
+            }
+            ESP_LOGI(HID_DEMO_TAG, "scurry: re-anchored node %d against edge %d",
+                     route.to, route.edge);
+        }
     }
 
     /* Node 0 is the controller's own screen. Sending anything here would mean
@@ -464,10 +503,22 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
     }
 
     int conn = scurry_conn_for_node(route.to);
-    if (conn >= 0) {
-        esp_hidd_send_mouse_report((uint16_t)conn, buttons,
-                                   route.abs_x, route.abs_y, wheel, pan);
+    if (conn < 0) {
+        static uint32_t unrouted = 0;
+        if ((unrouted++ % 120) == 0) {
+            ESP_LOGW(HID_DEMO_TAG, "scurry: node %d has no connection", route.to);
+        }
+        return;
     }
+
+    /* Throttled: enough to tell "not sending" from "sending and ignored",
+       without flooding the link we are also using for messages. */
+    static uint32_t sent = 0;
+    if ((sent++ % 120) == 0) {
+        ESP_LOGI(HID_DEMO_TAG, "scurry: report -> node %d conn %d d(%d,%d) btn %02x",
+                 route.to, conn, dx, dy, buttons);
+    }
+    esp_hidd_send_mouse_report((uint16_t)conn, buttons, dx, dy, wheel, pan);
 }
 
 static void scurry_send_config(void)
