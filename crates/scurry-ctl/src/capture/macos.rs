@@ -14,7 +14,7 @@
 //! it stops moving and position-based capture would report nothing, but the
 //! deltas keep coming because the mouse is still physically moving.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,13 +28,65 @@ use scurry_proto::{button, kind, MouseState};
 
 use crate::transport::Dongle;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
 extern "C" {
     /// Decouples the hardware mouse from the on-screen cursor, so the local
-    /// cursor stays put while deltas keep arriving.
+    /// cursor stays put while deltas keep arriving. Returns a CGError; 0 is
+    /// success. We check it -- assuming success is how the cursor kept moving
+    /// while the pointer was supposedly on another machine.
     fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+    fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGDisplayPixelsHigh(display: u32) -> usize;
+}
+
+/// Where the local cursor is parked while input belongs to another machine.
+/// Set once on going remote so the warp target does not drift.
+static PARK_X: AtomicI32 = AtomicI32::new(0);
+static PARK_Y: AtomicI32 = AtomicI32::new(0);
+
+/// Logged once per transition rather than per event, so a failing call is
+/// visible without flooding.
+fn report(call: &str, err: i32) {
+    if err != 0 {
+        eprintln!("warning: {call} failed with CGError {err}");
+    }
+}
+
+/// Put the cursor back under the user's control. Safe to call repeatedly.
+///
+/// Must run on every exit path, including signals: leaving the cursor hidden
+/// and decoupled would strand the user with a Mac that appears to have no
+/// pointer at all, recoverable only by logging out.
+extern "C" fn restore_cursor() {
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(1);
+        CGDisplayShowCursor(CGMainDisplayID());
+    }
+}
+
+extern "C" fn on_signal(_sig: i32) {
+    restore_cursor();
+    // _exit, not exit: async-signal-safe, and destructors would race here.
+    unsafe { libc::_exit(130) };
+}
+
+fn install_cleanup() {
+    unsafe {
+        libc::atexit(restore_cursor);
+        libc::signal(libc::SIGINT, on_signal as usize);
+        libc::signal(libc::SIGTERM, on_signal as usize);
+        libc::signal(libc::SIGHUP, on_signal as usize);
+    }
 }
 
 /// Node currently holding the pointer, as last announced by the dongle. 0 is
@@ -52,6 +104,13 @@ static REMOTE: AtomicBool = AtomicBool::new(false);
 fn hold_cursor() {
     unsafe {
         CGAssociateMouseAndMouseCursorPosition(0);
+        // Belt and braces. Decoupling alone proved not to hold in practice, so
+        // also pin the cursor to where it was parked. Warping is authoritative:
+        // whatever moved it, this puts it back.
+        CGWarpMouseCursorPosition(CGPoint {
+            x: PARK_X.load(Ordering::Relaxed) as f64,
+            y: PARK_Y.load(Ordering::Relaxed) as f64,
+        });
     }
 }
 
@@ -60,15 +119,23 @@ fn set_remote(remote: bool) {
         return;
     }
     unsafe {
+        let display = CGMainDisplayID();
         if remote {
-            hold_cursor();
-            // Hide it too. Decoupling stops the cursor moving but leaves it on
-            // screen, which reads as a frozen Mac rather than as input having
-            // gone elsewhere.
-            CGDisplayHideCursor(CGMainDisplayID());
+            // Park at the centre of the display. Anywhere would do; the centre
+            // keeps the cursor away from screen edges and hot corners, which
+            // can trigger Mission Control if the warp is ever imprecise.
+            PARK_X.store((CGDisplayPixelsWide(display) / 2) as i32, Ordering::Relaxed);
+            PARK_Y.store((CGDisplayPixelsHigh(display) / 2) as i32, Ordering::Relaxed);
+
+            report("CGAssociateMouseAndMouseCursorPosition(0)",
+                   CGAssociateMouseAndMouseCursorPosition(0));
+            report("CGDisplayHideCursor", CGDisplayHideCursor(display));
+            // Hide as well as freeze: a stationary visible cursor reads as a
+            // hung Mac rather than as input having gone elsewhere.
         } else {
-            CGAssociateMouseAndMouseCursorPosition(1);
-            CGDisplayShowCursor(CGMainDisplayID());
+            report("CGAssociateMouseAndMouseCursorPosition(1)",
+                   CGAssociateMouseAndMouseCursorPosition(1));
+            report("CGDisplayShowCursor", CGDisplayShowCursor(display));
         }
     }
 }
@@ -106,6 +173,8 @@ fn clamp_i16(v: i64) -> i16 {
 
 /// Capture local input and forward it to the dongle, forever.
 pub fn run(dongle: Dongle) -> Result<()> {
+    install_cleanup();
+
     // The dongle owns the layout, so it must tell us where the pointer went;
     // we cannot work it out. A reader thread applies those announcements and
     // surfaces the firmware's log output, which shares this pipe.
@@ -203,7 +272,18 @@ pub fn run(dongle: Dongle) -> Result<()> {
             let _ = dongle.send(kind::MOUSE, &state.encode());
             drop(guard);
 
-            if REMOTE.load(Ordering::Relaxed) {
+            // The invariant: exactly one machine consumes any given event.
+            // Passing it through locally while the dongle is routing it to a
+            // target is what makes two pointers move at once, which must never
+            // happen. FOCUS is the only thing that keeps the two ends in
+            // agreement, so a disagreement here means it was lost.
+            let remote = REMOTE.load(Ordering::Relaxed);
+            debug_assert_eq!(
+                remote,
+                FOCUS.load(Ordering::Relaxed) != 0,
+                "REMOTE and FOCUS disagree: both pointers would move"
+            );
+            if remote {
                 hold_cursor(); // re-assert; see hold_cursor()
                 None // swallow: this input belongs to another machine
             } else {

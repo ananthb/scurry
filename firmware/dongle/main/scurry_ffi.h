@@ -20,6 +20,12 @@ typedef struct {
     uint8_t  to;       /* node now holding the pointer; 0 = controller's own */
     uint8_t  edge;     /* arrival edge: 0=L 1=R 2=T 3=B; only when crossed */
     uint16_t ratio;    /* position along that edge; only when crossed */
+    /* Pointer position within `to`, normalised to 0..=32767, sent as an
+       absolute HID coordinate. Relative motion would require dead reckoning,
+       which breaks as soon as anything else moves the remote pointer or the
+       target applies its own acceleration to our deltas. */
+    uint16_t abs_x;
+    uint16_t abs_y;
 } scurry_route_t;
 
 /* Install a layout from a CONFIG payload (count byte, then that many screens).

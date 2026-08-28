@@ -122,7 +122,7 @@ void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask,
 }
 
 void esp_hidd_send_mouse_report(uint16_t conn_id, uint8_t buttons,
-                                int16_t dx, int16_t dy, int8_t wheel, int8_t pan)
+                                uint16_t x, uint16_t y, int8_t wheel, int8_t pan)
 {
     uint8_t buffer[HID_MOUSE_IN_RPT_LEN];
 
@@ -130,10 +130,10 @@ void esp_hidd_send_mouse_report(uint16_t conn_id, uint8_t buttons,
        notification, and a lost "release" would strand a held button on a
        machine the user is no longer sitting at. Every report repairs it. */
     buffer[0] = buttons & 0x1F;         // 5 buttons
-    buffer[1] = (uint8_t)(dx & 0xFF);   // X, little-endian
-    buffer[2] = (uint8_t)((dx >> 8) & 0xFF);
-    buffer[3] = (uint8_t)(dy & 0xFF);   // Y, little-endian
-    buffer[4] = (uint8_t)((dy >> 8) & 0xFF);
+    buffer[1] = (uint8_t)(x & 0xFF);    // X, absolute, little-endian
+    buffer[2] = (uint8_t)((x >> 8) & 0xFF);
+    buffer[3] = (uint8_t)(y & 0xFF);    // Y, absolute, little-endian
+    buffer[4] = (uint8_t)((y >> 8) & 0xFF);
     buffer[5] = (uint8_t)wheel;
     buffer[6] = (uint8_t)pan;
 

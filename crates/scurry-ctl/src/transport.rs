@@ -133,7 +133,12 @@ impl Dongle {
                     let start = skipped + HEADER_LEN;
                     let payload = self.buf[start..start + h.len as usize].to_vec();
                     self.flush_log(skipped, on_log);
-                    self.buf.drain(..total);
+                    // Drain the skipped log bytes AND the message. Draining
+                    // only `total` left the skipped prefix in place and ate an
+                    // equal number of bytes off the message instead, so the
+                    // stream stayed misaligned from the first message that
+                    // happened to follow log output -- which is most of them.
+                    self.buf.drain(..skipped + total);
                     return Some(Message { kind: h.kind, payload });
                 }
                 Err(_) => {
@@ -143,9 +148,8 @@ impl Dongle {
         }
         // Keep the last few bytes: a header may be split across reads.
         if skipped > 0 {
-            let keep = skipped.saturating_sub(0);
-            self.flush_log(keep, on_log);
-            self.buf.drain(..keep);
+            self.flush_log(skipped, on_log);
+            self.buf.drain(..skipped);
         }
         None
     }

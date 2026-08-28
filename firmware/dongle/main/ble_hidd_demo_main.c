@@ -432,6 +432,8 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
     int16_t dy = (int16_t)((uint16_t)p[3] | ((uint16_t)p[4] << 8));
     int8_t  wheel = (int8_t)p[5];
     int8_t  pan   = (int8_t)p[6];
+    /* dx/dy feed the layout only. What goes out is the absolute position the
+       layout computes, never the raw delta. */
 
     if (!scurry_layout_ready()) {
         return; /* nowhere to route: drop rather than guess */
@@ -445,17 +447,26 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
     if (route.crossed) {
         /* Release on the machine being left before the pointer arrives
            anywhere else, or a drag across the boundary strands a held button
-           on a machine the user is no longer sitting at. */
+           on a machine the user is no longer sitting at. Position is held at
+           whatever it was; only the buttons are cleared. */
         int from_conn = scurry_conn_for_node(route.from);
         if (from_conn >= 0) {
-            esp_hidd_send_mouse_report((uint16_t)from_conn, 0, 0, 0, 0, 0);
+            esp_hidd_send_mouse_report((uint16_t)from_conn, 0,
+                                       route.abs_x, route.abs_y, 0, 0);
         }
         scurry_announce_focus(route.to);
     }
 
+    /* Node 0 is the controller's own screen. Sending anything here would mean
+       two pointers moving at once, which must never happen. */
+    if (route.to == 0) {
+        return;
+    }
+
     int conn = scurry_conn_for_node(route.to);
     if (conn >= 0) {
-        esp_hidd_send_mouse_report((uint16_t)conn, buttons, dx, dy, wheel, pan);
+        esp_hidd_send_mouse_report((uint16_t)conn, buttons,
+                                   route.abs_x, route.abs_y, wheel, pan);
     }
 }
 

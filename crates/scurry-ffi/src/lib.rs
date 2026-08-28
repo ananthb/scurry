@@ -25,6 +25,25 @@ pub struct ScurryRoute {
     pub edge: u8,
     /// Position along that edge. Only when `crossed`.
     pub ratio: u16,
+    /// Pointer position within `to`, normalised to 0..=32767.
+    ///
+    /// The dongle sends this as an absolute HID coordinate rather than a
+    /// relative nudge. Relative motion requires dead reckoning -- assuming our
+    /// model of the remote pointer matches reality -- and that assumption is
+    /// false the moment anything else moves the pointer, or as soon as the
+    /// target applies its own pointer acceleration to our deltas. Absolute
+    /// coordinates have no such failure mode.
+    pub abs_x: u16,
+    pub abs_y: u16,
+}
+
+/// Normalise a coordinate within a span to 0..=32767, the HID logical range.
+fn normalise(offset: i32, span: i32) -> u16 {
+    if span <= 1 {
+        return 0;
+    }
+    let clamped = offset.clamp(0, span - 1) as i64;
+    ((clamped * 32767) / (span - 1) as i64) as u16
 }
 
 /// The single layout. The firmware is single-threaded over this: only the
@@ -136,16 +155,33 @@ pub unsafe extern "C" fn scurry_layout_advance(dx: i32, dy: i32, out: *mut Scurr
         Some(l) => l,
         None => return -2,
     };
-    let r = match layout.advance(dx, dy) {
-        Motion::Stayed { node, .. } => {
-            ScurryRoute { crossed: 0, from: node, to: node, edge: 0, ratio: 0 }
-        }
+    let motion = layout.advance(dx, dy);
+
+    // Position is read after the move, from the screen now holding the pointer,
+    // so the normalisation uses the destination's dimensions.
+    let active = layout.active();
+    let (px, py) = layout.position();
+    let abs_x = normalise(px - active.x, active.width);
+    let abs_y = normalise(py - active.y, active.height);
+
+    let r = match motion {
+        Motion::Stayed { node, .. } => ScurryRoute {
+            crossed: 0,
+            from: node,
+            to: node,
+            edge: 0,
+            ratio: 0,
+            abs_x,
+            abs_y,
+        },
         Motion::Crossed { from, to, edge, ratio, .. } => ScurryRoute {
             crossed: 1,
             from,
             to,
             edge: edge_to_wire(edge),
             ratio,
+            abs_x,
+            abs_y,
         },
     };
     core::ptr::write(out, r);
