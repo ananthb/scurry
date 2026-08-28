@@ -45,8 +45,6 @@ extern "C" {
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
 }
 
 /// Where the local cursor is parked while input belongs to another machine.
@@ -91,9 +89,9 @@ extern "C" fn on_signal(_sig: i32) {
 fn install_cleanup() {
     unsafe {
         libc::atexit(restore_cursor);
-        libc::signal(libc::SIGINT, on_signal as usize);
-        libc::signal(libc::SIGTERM, on_signal as usize);
-        libc::signal(libc::SIGHUP, on_signal as usize);
+        libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
+        libc::signal(libc::SIGHUP, on_signal as *const () as usize);
     }
 }
 
