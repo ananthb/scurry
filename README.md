@@ -36,8 +36,8 @@ the target applies its own keymap on top.
 |---|---|
 | `scurry-proto` wire format | done, tested, `no_std` verified on riscv32imc |
 | `scurry-ctl` layout engine | done, tested |
-| `scurry-ctl` input capture | not started |
-| dongle BLE HID firmware | spike passed: 2 bonded hosts held concurrently |
+| `scurry-ctl` input capture | macOS event tap done, untested on device |
+| dongle BLE HID firmware | working: reports reach a paired machine |
 
 ### The spike
 

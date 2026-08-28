@@ -9,6 +9,7 @@ fn usage() -> ! {
         "usage: scurry-ctl <command>
 
 commands:
+  run [config]        capture local input and route it (default scurry.toml)
   probe               list serial ports and identify the dongle
   test-move [node]    send synthetic pointer motion to a node (default 1)
   test-click [node]   send a left click to a node (default 1)
@@ -23,19 +24,41 @@ Accessibility permissions."
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or_else(|| usage());
-    let node: u8 = args
-        .get(1)
-        .map(|s| s.parse())
-        .transpose()
-        .context("node must be a number")?
-        .unwrap_or(1);
+
+    // Parsed per command: `run` takes a config path in the same position that
+    // the test commands take a node id, so parsing it eagerly would reject
+    // `run scurry.toml` before doing anything.
+    let node = || -> Result<u8> {
+        Ok(args
+            .get(1)
+            .map(|s| s.parse())
+            .transpose()
+            .context("node must be a number 1..=4")?
+            .unwrap_or(1))
+    };
 
     match cmd {
+        "run" => run(args.get(1).map(String::as_str).unwrap_or("scurry.toml")),
         "probe" => probe(),
-        "test-move" => test_move(node),
-        "test-click" => test_click(node),
+        "test-move" => test_move(node()?),
+        "test-click" => test_click(node()?),
         _ => usage(),
     }
+}
+
+fn run(config_path: &str) -> Result<()> {
+    let cfg = scurry_ctl::config::Config::load(config_path)?;
+    let device = cfg.device.clone();
+    let layout = cfg.into_layout()?;
+
+    let path = match device {
+        Some(d) => d,
+        None => SerialTransport::autodetect()?,
+    };
+    eprintln!("dongle: {path}");
+    let transport = SerialTransport::open(&path)?;
+
+    scurry_ctl::capture::run(layout, transport)
 }
 
 fn probe() -> Result<()> {
