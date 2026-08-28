@@ -1,0 +1,16 @@
+[package]
+name = "scurry-proto"
+description = "Wire format shared by the scurry controller, dongle, and nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately zero dependencies. The frame is fixed-size, so a hand-rolled
+# codec is smaller than postcard+serde and compiles identically on host,
+# riscv32imc, and xtensa with no feature-flag dance.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

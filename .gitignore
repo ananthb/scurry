@@ -1,0 +1,5 @@
+/target
+/firmware/target
+result
+result-*
+.direnv

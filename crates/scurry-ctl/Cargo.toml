@@ -1,0 +1,10 @@
+[package]
+name = "scurry-ctl"
+description = "scurry controller: captures local input and routes it across the virtual desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+scurry-proto.workspace = true

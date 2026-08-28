@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/scurry-proto", "crates/scurry-ctl"]
+
+# Firmware lives in its own workspace under firmware/: it is no_std, targets
+# riscv32imc (dongle) and xtensa (node), and must not inherit host dev-deps.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ananthb/scurry"
+
+[workspace.dependencies]
+scurry-proto = { path = "crates/scurry-proto" }
