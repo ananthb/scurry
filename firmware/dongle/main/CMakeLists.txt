@@ -13,13 +13,15 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-const-variable)
 set(SCURRY_FFI_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../crates/scurry-ffi)
 set(SCURRY_FFI_LIB ${SCURRY_FFI_DIR}/target/riscv32imc-unknown-none-elf/release/libscurry_ffi.a)
 
-add_custom_command(
-    OUTPUT ${SCURRY_FFI_LIB}
+# An unconditional target rather than add_custom_command(OUTPUT ...): that form
+# only reruns when its declared dependencies change, and listing every Rust
+# source here would go stale silently -- linking a months-old .a while the crate
+# had moved on. Cargo already knows what needs rebuilding and no-ops otherwise.
+add_custom_target(scurry_ffi_build ALL
     COMMAND cargo build --release --target riscv32imc-unknown-none-elf
     WORKING_DIRECTORY ${SCURRY_FFI_DIR}
+    BYPRODUCTS ${SCURRY_FFI_LIB}
     COMMENT "Building scurry-ffi (Rust layout engine) for riscv32imc"
     VERBATIM)
-
-add_custom_target(scurry_ffi_build DEPENDS ${SCURRY_FFI_LIB})
 add_dependencies(${COMPONENT_LIB} scurry_ffi_build)
 target_link_libraries(${COMPONENT_LIB} PRIVATE ${SCURRY_FFI_LIB})

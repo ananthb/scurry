@@ -50,9 +50,17 @@ extern "C" {
 }
 
 /// Where the local cursor is parked while input belongs to another machine.
-/// Set once on going remote so the warp target does not drift.
+///
+/// Set to wherever the cursor actually was at handoff, not to the middle of the
+/// display: the pointer left at a screen edge and should still be there when it
+/// comes back. Warping it to the centre made it visibly jump on every crossing.
 static PARK_X: AtomicI32 = AtomicI32::new(0);
 static PARK_Y: AtomicI32 = AtomicI32::new(0);
+
+/// Last cursor position seen while input was still local, which is what the
+/// park position is taken from.
+static LAST_X: AtomicI32 = AtomicI32::new(0);
+static LAST_Y: AtomicI32 = AtomicI32::new(0);
 
 /// Logged once per transition rather than per event, so a failing call is
 /// visible without flooding.
@@ -121,11 +129,9 @@ fn set_remote(remote: bool) {
     unsafe {
         let display = CGMainDisplayID();
         if remote {
-            // Park at the centre of the display. Anywhere would do; the centre
-            // keeps the cursor away from screen edges and hot corners, which
-            // can trigger Mission Control if the warp is ever imprecise.
-            PARK_X.store((CGDisplayPixelsWide(display) / 2) as i32, Ordering::Relaxed);
-            PARK_Y.store((CGDisplayPixelsHigh(display) / 2) as i32, Ordering::Relaxed);
+            // Park where the cursor already is -- at the edge it left from.
+            PARK_X.store(LAST_X.load(Ordering::Relaxed), Ordering::Relaxed);
+            PARK_Y.store(LAST_Y.load(Ordering::Relaxed), Ordering::Relaxed);
 
             report("CGAssociateMouseAndMouseCursorPosition(0)",
                    CGAssociateMouseAndMouseCursorPosition(0));
@@ -242,6 +248,12 @@ pub fn run(dongle: Dongle) -> Result<()> {
                 Err(_) => return Some(event.clone()),
             };
             let (dongle, buttons) = &mut *guard;
+
+            if !REMOTE.load(Ordering::Relaxed) {
+                let loc = event.location();
+                LAST_X.store(loc.x as i32, Ordering::Relaxed);
+                LAST_Y.store(loc.y as i32, Ordering::Relaxed);
+            }
 
             let mut state = MouseState::default();
             match event_type {

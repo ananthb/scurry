@@ -36,6 +36,14 @@ pub const MAX_SCREENS: usize = 5;
 /// Screen names are fixed-width so the engine needs no allocator.
 pub const NAME_LEN: usize = 16;
 
+/// How far inside the destination edge an arriving pointer is placed.
+///
+/// Without this the pointer lands exactly on the boundary, so one pixel of
+/// reverse motion crosses straight back and focus oscillates -- observed
+/// flapping between two machines every 20ms. The inset is hysteresis: you have
+/// to mean it to come back.
+pub const ARRIVAL_INSET: i32 = 12;
+
 /// One screen in the virtual desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Screen {
@@ -268,7 +276,16 @@ impl Layout {
             let ratio = src.ratio_along(edge.opposite(), ex, ey);
 
             let dest = &self.screens[idx];
-            let (px, py) = dest.point_on(edge, ratio);
+            let (ax, ay) = dest.point_on(edge, ratio);
+            // Step inside the edge so reverse jitter does not re-cross.
+            let inset = ARRIVAL_INSET.min(dest.width / 4).min(dest.height / 4);
+            let (px, py) = match edge {
+                Edge::Left => (ax + inset, ay),
+                Edge::Right => (ax - inset, ay),
+                Edge::Top => (ax, ay + inset),
+                Edge::Bottom => (ax, ay - inset),
+            };
+            let (px, py) = dest.clamp(px, py);
 
             self.current = idx;
             self.x = px;
@@ -330,11 +347,28 @@ mod tests {
             Motion::Crossed { from, to, edge, x, .. } => {
                 assert_eq!((from, to), (0, 1));
                 assert_eq!(edge, Edge::Left);
-                assert_eq!(x, 1000, "should arrive on the destination's left edge");
+                assert_eq!(x, 1000 + ARRIVAL_INSET, "arrives inset from the left edge");
             }
             other => panic!("expected a crossing, got {other:?}"),
         }
         assert!(!l.is_local());
+    }
+
+    #[test]
+    fn arrival_inset_stops_focus_flapping() {
+        // The bug this prevents: landing exactly on the boundary meant one
+        // pixel of reverse motion crossed straight back, and focus oscillated
+        // between two machines every 20ms.
+        let mut l = pair();
+        assert!(matches!(l.advance(600, 0), Motion::Crossed { .. }));
+        for _ in 0..(ARRIVAL_INSET - 1) {
+            match l.advance(-1, 0) {
+                Motion::Stayed { node, .. } => assert_eq!(node, 1, "must stay on the neighbour"),
+                other => panic!("jitter must not re-cross, got {other:?}"),
+            }
+        }
+        // Deliberate motion past the inset still crosses back.
+        assert!(matches!(l.advance(-4, 0), Motion::Crossed { to: 0, .. }));
     }
 
     #[test]
