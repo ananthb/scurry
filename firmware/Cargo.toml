@@ -1,0 +1,6 @@
+# Firmware lives in its own workspace: it cross-compiles, is built with
+# build-std, and must not inherit the host workspace's dev-dependencies or
+# its default target.
+[workspace]
+resolver = "2"
+members = ["dongle"]

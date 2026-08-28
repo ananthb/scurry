@@ -1,0 +1,25 @@
+[package]
+name = "scurry-dongle"
+description = "ESP32-C3 bridge: USB CDC from the controller, BLE HID out to targets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+scurry-proto = { path = "../../crates/scurry-proto", default-features = false }
+esp-idf-svc = "0.51"
+esp-idf-hal = "0.45"
+# Wraps NimBLE's HID device role. esp-idf-svc's own BT surface is too thin for
+# a multi-connection HID peripheral, which is the whole point of this spike.
+esp32-nimble = "0.11"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+opt-level = "z"

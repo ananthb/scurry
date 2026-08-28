@@ -22,7 +22,11 @@
         # a stock target. The nodes are ESP32-S3, which is Xtensa and needs the
         # esp-rs rustc fork via espup — deliberately NOT wired in here, so the
         # host and dongle toolchain stays reproducible. See doc/toolchain.md.
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        # Nightly because the dongle's std target, riscv32imc-esp-espidf, is
+        # tier 3: rustc knows the target spec but no std is distributed for it,
+        # so it must be built from source with -Zbuild-std. That needs rust-src
+        # and an unstable cargo. The host crates do not care either way.
+        rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           targets = [ "riscv32imc-unknown-none-elf" ];
         };
@@ -33,6 +37,12 @@
             rustToolchain
             espflash   # flash and monitor the C3 over its USB Serial/JTAG
             esptool
+
+            # esp-idf-sys's build script fetches and builds ESP-IDF itself into
+            # .embuild/. nixpkgs has no esp-idf derivation, so these are its
+            # host requirements. ldproxy is not packaged either and is installed
+            # into .cargo/bin by `just dongle-setup`.
+            git wget cmake ninja dfu-util python3 ncurses
           ];
 
           # scurry-ctl links CoreGraphics/ApplicationServices for event capture

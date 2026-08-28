@@ -1,0 +1,7 @@
+# Only consulted when building outside the Nix devshell. rustc has the
+# riscv32imc-esp-espidf target spec built in, but no std is distributed for it,
+# so rust-src plus -Zbuild-std (see .cargo/config.toml) supplies std instead.
+# Listing it under `targets` would fail: there is nothing to download.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

@@ -3,3 +3,6 @@
 result
 result-*
 .direnv
+/firmware/**/.embuild
+/firmware/**/target
+.cargo-tools
