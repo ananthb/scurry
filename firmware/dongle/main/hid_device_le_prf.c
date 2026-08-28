@@ -28,11 +28,22 @@ static hid_report_map_t hid_rpt_map[HID_NUM_REPORTS];
 
 // HID Report Map characteristic value
 // Keyboard report descriptor (using format for Boot interface descriptor)
+/* Mouse only.
+ *
+ * Upstream declared three collections -- mouse, keyboard and consumer. Hosts
+ * latched onto the keyboard and ignored the mouse: ChromeOS and Android both
+ * showed no pointer while actively writing keyboard LED reports back to us,
+ * which is how we know they had parsed the map and chosen the other collection.
+ * A single-collection mouse is the most widely handled BLE HID device there is.
+ *
+ * The keyboard comes back when keyboard support does, and will need testing on
+ * each host rather than assuming a combo device is accepted.
+ */
 static const uint8_t hidReportMap[] = {
-    0x05, 0x01,  // Usage Page (Generic Desktop)
+    0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x02,        // Usage (Mouse)
     0xA1, 0x01,        // Collection (Application)
-    0x85, 0x01,        // Report Id (1)
+    0x85, 0x01,        //   Report Id (1)
     0x09, 0x01,        //   Usage (Pointer)
     0xA1, 0x00,        //   Collection (Physical)
     0x05, 0x09,        //     Usage Page (Buttons)
@@ -53,13 +64,6 @@ static const uint8_t hidReportMap[] = {
     0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
     0x75, 0x10,        //     Report Size (16)
     0x95, 0x02,        //     Report Count (2)
-    /* Relative. Absolute axes are cleaner in principle -- no dead reckoning to
-       drift -- but ChromeOS silently ignores an absolute-axis Mouse collection:
-       the cursor simply never appears. Android behaves the same way. Absolute
-       pointing there needs a Digitizer, which brings its own problems (treated
-       as a stylus, no hover, odd multi-display behaviour).
-       Dead reckoning is instead re-anchored on every crossing; see the slam in
-       scurry_handle_mouse(). */
     0x81, 0x06,        //     Input (Data, Variable, Relative) - X, Y
     0x09, 0x38,        //     Usage (Wheel)
     0x15, 0x81,        //     Logical Minimum (-127)
@@ -73,124 +77,6 @@ static const uint8_t hidReportMap[] = {
     0x81, 0x06,        //     Input (Data, Variable, Relative) - horizontal pan
     0xC0,              //   End Collection
     0xC0,              // End Collection
-
-    0x05, 0x01,  // Usage Pg (Generic Desktop)
-    0x09, 0x06,  // Usage (Keyboard)
-    0xA1, 0x01,  // Collection: (Application)
-    0x85, 0x02,  // Report Id (2)
-    //
-    0x05, 0x07,  //   Usage Pg (Key Codes)
-    0x19, 0xE0,  //   Usage Min (224)
-    0x29, 0xE7,  //   Usage Max (231)
-    0x15, 0x00,  //   Log Min (0)
-    0x25, 0x01,  //   Log Max (1)
-    //
-    //   Modifier byte
-    0x75, 0x01,  //   Report Size (1)
-    0x95, 0x08,  //   Report Count (8)
-    0x81, 0x02,  //   Input: (Data, Variable, Absolute)
-    //
-    //   Reserved byte
-    0x95, 0x01,  //   Report Count (1)
-    0x75, 0x08,  //   Report Size (8)
-    0x81, 0x01,  //   Input: (Constant)
-    //
-    //   LED report
-    0x05, 0x08,  //   Usage Pg (LEDs)
-    0x19, 0x01,  //   Usage Min (1)
-    0x29, 0x05,  //   Usage Max (5)
-    0x95, 0x05,  //   Report Count (5)
-    0x75, 0x01,  //   Report Size (1)
-    0x91, 0x02,  //   Output: (Data, Variable, Absolute)
-    //
-    //   LED report padding
-    0x95, 0x01,  //   Report Count (1)
-    0x75, 0x03,  //   Report Size (3)
-    0x91, 0x01,  //   Output: (Constant)
-    //
-    //   Key arrays (6 bytes)
-    0x95, 0x06,  //   Report Count (6)
-    0x75, 0x08,  //   Report Size (8)
-    0x15, 0x00,  //   Log Min (0)
-    0x25, 0x65,  //   Log Max (101)
-    0x05, 0x07,  //   Usage Pg (Key Codes)
-    0x19, 0x00,  //   Usage Min (0)
-    0x29, 0x65,  //   Usage Max (101)
-    0x81, 0x00,  //   Input: (Data, Array)
-    //
-    0xC0,        // End Collection
-    //
-    0x05, 0x0C,   // Usage Pg (Consumer Devices)
-    0x09, 0x01,   // Usage (Consumer Control)
-    0xA1, 0x01,   // Collection (Application)
-    0x85, 0x03,   // Report Id (3)
-    0x09, 0x02,   //   Usage (Numeric Key Pad)
-    0xA1, 0x02,   //   Collection (Logical)
-    0x05, 0x09,   //     Usage Pg (Button)
-    0x19, 0x01,   //     Usage Min (Button 1)
-    0x29, 0x0A,   //     Usage Max (Button 10)
-    0x15, 0x01,   //     Logical Min (1)
-    0x25, 0x0A,   //     Logical Max (10)
-    0x75, 0x04,   //     Report Size (4)
-    0x95, 0x01,   //     Report Count (1)
-    0x81, 0x00,   //     Input (Data, Ary, Abs)
-    0xC0,         //   End Collection
-    0x05, 0x0C,   //   Usage Pg (Consumer Devices)
-    0x09, 0x86,   //   Usage (Channel)
-    0x15, 0xFF,   //   Logical Min (-1)
-    0x25, 0x01,   //   Logical Max (1)
-    0x75, 0x02,   //   Report Size (2)
-    0x95, 0x01,   //   Report Count (1)
-    0x81, 0x46,   //   Input (Data, Var, Rel, Null)
-    0x09, 0xE9,   //   Usage (Volume Up)
-    0x09, 0xEA,   //   Usage (Volume Down)
-    0x15, 0x00,   //   Logical Min (0)
-    0x75, 0x01,   //   Report Size (1)
-    0x95, 0x02,   //   Report Count (2)
-    0x81, 0x02,   //   Input (Data, Var, Abs)
-    0x09, 0xE2,   //   Usage (Mute)
-    0x09, 0x30,   //   Usage (Power)
-    0x09, 0x83,   //   Usage (Recall Last)
-    0x09, 0x81,   //   Usage (Assign Selection)
-    0x09, 0xB0,   //   Usage (Play)
-    0x09, 0xB1,   //   Usage (Pause)
-    0x09, 0xB2,   //   Usage (Record)
-    0x09, 0xB3,   //   Usage (Fast Forward)
-    0x09, 0xB4,   //   Usage (Rewind)
-    0x09, 0xB5,   //   Usage (Scan Next)
-    0x09, 0xB6,   //   Usage (Scan Prev)
-    0x09, 0xB7,   //   Usage (Stop)
-    0x15, 0x01,   //   Logical Min (1)
-    0x25, 0x0C,   //   Logical Max (12)
-    0x75, 0x04,   //   Report Size (4)
-    0x95, 0x01,   //   Report Count (1)
-    0x81, 0x00,   //   Input (Data, Ary, Abs)
-    0x09, 0x80,   //   Usage (Selection)
-    0xA1, 0x02,   //   Collection (Logical)
-    0x05, 0x09,   //     Usage Pg (Button)
-    0x19, 0x01,   //     Usage Min (Button 1)
-    0x29, 0x03,   //     Usage Max (Button 3)
-    0x15, 0x01,   //     Logical Min (1)
-    0x25, 0x03,   //     Logical Max (3)
-    0x75, 0x02,   //     Report Size (2)
-    0x81, 0x00,   //     Input (Data, Ary, Abs)
-    0xC0,           //   End Collection
-    0x81, 0x03,   //   Input (Const, Var, Abs)
-    0xC0,            // End Collectionq
-
-#if (SUPPORT_REPORT_VENDOR == true)
-    0x06, 0xFF, 0xFF, // Usage Page(Vendor defined)
-    0x09, 0xA5,       // Usage(Vendor Defined)
-    0xA1, 0x01,       // Collection(Application)
-    0x85, 0x04,   // Report Id (4)
-    0x09, 0xA6,   // Usage(Vendor defined)
-    0x09, 0xA9,   // Usage(Vendor defined)
-    0x75, 0x08,   // Report Size
-    0x95, 0x7F,   // Report Count = 127 Btyes
-    0x91, 0x02,   // Output(Data, Variable, Absolute)
-    0xC0,         // End Collection
-#endif
-
 };
 
 /// Battery Service Attributes Indexes
@@ -603,6 +489,36 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
             break;
         case ESP_GATTS_WRITE_EVT: {
             esp_hidd_cb_param_t cb_param = {0};
+
+            /* Which characteristic the host writes tells us why reports are
+               being ignored:
+                 - the mouse CCCD is how it subscribes; without that write, our
+                   notifications go nowhere
+                 - Protocol Mode 0 means it switched us to Boot Protocol, where
+                   it expects a 3-byte report on the *boot* characteristic and
+                   will ignore everything we send on the report one. */
+            {
+                uint16_t *tbl = hidd_le_env.hidd_inst.att_tbl;
+                uint16_t h = param->write.handle;
+                uint8_t v0 = param->write.len > 0 ? param->write.value[0] : 0xFF;
+                if (h == tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_CCC]) {
+                    ESP_LOGW(HID_LE_PRF_TAG,
+                             "scurry: host %s mouse report notifications (cccd=%u)",
+                             (v0 & 0x01) ? "ENABLED" : "disabled", v0);
+                } else if (h == tbl[HIDD_LE_IDX_PROTO_MODE_VAL]) {
+                    ESP_LOGW(HID_LE_PRF_TAG,
+                             "scurry: host set protocol mode %u (%s)",
+                             v0, v0 == 0 ? "BOOT -- our report-protocol reports will be ignored"
+                                         : "report");
+                } else if (h == tbl[HIDD_LE_IDX_BOOT_MOUSE_IN_REPORT_NTF_CFG]) {
+                    ESP_LOGW(HID_LE_PRF_TAG,
+                             "scurry: host %s BOOT mouse notifications (cccd=%u)",
+                             (v0 & 0x01) ? "ENABLED" : "disabled", v0);
+                } else {
+                    ESP_LOGI(HID_LE_PRF_TAG, "scurry: write to handle %u, %d bytes",
+                             h, param->write.len);
+                }
+            }
             if (param->write.handle == hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_LED_OUT_VAL]) {
                 cb_param.led_write.conn_id = param->write.conn_id;
                 cb_param.led_write.report_id = HID_RPT_ID_LED_OUT;
