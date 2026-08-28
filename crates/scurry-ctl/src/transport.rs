@@ -19,6 +19,10 @@ pub struct Dongle {
     seq: u16,
     /// Bytes read but not yet consumed, so a partial message survives a read.
     buf: Vec<u8>,
+    /// Log text seen so far without a terminating newline. The dongle's output
+    /// arrives in whatever chunks the USB reads land in, so a line routinely
+    /// straddles two reads and would otherwise be printed in fragments.
+    log_partial: String,
 }
 
 impl Dongle {
@@ -32,7 +36,7 @@ impl Dongle {
             .timeout(Duration::from_millis(20))
             .open()
             .with_context(|| format!("opening dongle at {path}"))?;
-        Ok(Self { port, seq: 0, buf: Vec::with_capacity(4096) })
+        Ok(Self { port, seq: 0, buf: Vec::with_capacity(4096), log_partial: String::new() })
     }
 
     /// Espressif's USB Serial/JTAG appears as usbmodem on macOS, ttyACM on Linux.
@@ -59,6 +63,7 @@ impl Dongle {
             port: self.port.try_clone().context("cloning serial port")?,
             seq: 0,
             buf: Vec::with_capacity(4096),
+            log_partial: String::new(),
         })
     }
 
@@ -145,13 +150,18 @@ impl Dongle {
         None
     }
 
-    fn flush_log(&self, upto: usize, on_log: &mut dyn FnMut(&str)) {
+    fn flush_log(&mut self, upto: usize, on_log: &mut dyn FnMut(&str)) {
         if upto == 0 {
             return;
         }
-        let text = String::from_utf8_lossy(&self.buf[..upto]);
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
+        self.log_partial
+            .push_str(&String::from_utf8_lossy(&self.buf[..upto]));
+
+        // Emit only complete lines; hold anything after the last newline until
+        // the rest of it arrives.
+        while let Some(nl) = self.log_partial.find('\n') {
+            let line: String = self.log_partial.drain(..=nl).collect();
+            let line = line.trim_end_matches(['\n', '\r']);
             if !line.is_empty() {
                 on_log(line);
             }

@@ -112,7 +112,10 @@ fn status() -> Result<()> {
         bail!("empty status payload");
     }
     let count = msg.payload[0] as usize;
-    println!("{:<6} {:<10} {}", "node", "bonded", "address");
+    // "connected", not "bonded": this is the dongle's live connection
+    // table. Bonds persist in NVS across a reboot, connections do not, so a
+    // freshly reset dongle shows nothing here until a host reconnects.
+    println!("{:<6} {:<11} {}", "node", "connected", "address");
     for i in 0..count {
         let off = 1 + i * SlotStatus::WIRE_LEN;
         let Some(s) = msg.payload.get(off..).and_then(SlotStatus::decode) else {
@@ -124,7 +127,7 @@ fn status() -> Result<()> {
             s.bda.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
         };
         // Node ids are slot + 1; node 0 is the controller's own screen.
-        println!("{:<6} {:<10} {}", s.slot + 1, if s.connected { "yes" } else { "no" }, addr);
+        println!("{:<6} {:<11} {}", s.slot + 1, if s.connected { "yes" } else { "no" }, addr);
     }
     Ok(())
 }
