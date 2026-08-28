@@ -18,7 +18,10 @@
 #define HID_LED_OUT_RPT_LEN         1
 
 // HID mouse input report length
-#define HID_MOUSE_IN_RPT_LEN        5
+/* scurry: was 5, but the descriptor only declared 4 bytes -- the AC Pan
+   byte was sent undeclared. Now 7 and fully declared:
+   buttons(1) + X(2, LE) + Y(2, LE) + wheel(1) + pan(1). */
+#define HID_MOUSE_IN_RPT_LEN        7
 
 // HID consumer control input report length
 #define HID_CC_IN_RPT_LEN           2
@@ -118,15 +121,21 @@ void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask,
     return;
 }
 
-void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y)
+void esp_hidd_send_mouse_report(uint16_t conn_id, uint8_t buttons,
+                                int16_t dx, int16_t dy, int8_t wheel, int8_t pan)
 {
     uint8_t buffer[HID_MOUSE_IN_RPT_LEN];
 
-    buffer[0] = mouse_button;   // Buttons
-    buffer[1] = mickeys_x;           // X
-    buffer[2] = mickeys_y;           // Y
-    buffer[3] = 0;           // Wheel
-    buffer[4] = 0;           // AC Pan
+    /* Buttons are absolute state, not press/release deltas: BLE can drop a
+       notification, and a lost "release" would strand a held button on a
+       machine the user is no longer sitting at. Every report repairs it. */
+    buffer[0] = buttons & 0x1F;         // 5 buttons
+    buffer[1] = (uint8_t)(dx & 0xFF);   // X, little-endian
+    buffer[2] = (uint8_t)((dx >> 8) & 0xFF);
+    buffer[3] = (uint8_t)(dy & 0xFF);   // Y, little-endian
+    buffer[4] = (uint8_t)((dy >> 8) & 0xFF);
+    buffer[5] = (uint8_t)wheel;
+    buffer[6] = (uint8_t)pan;
 
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                         HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, HID_MOUSE_IN_RPT_LEN, buffer);

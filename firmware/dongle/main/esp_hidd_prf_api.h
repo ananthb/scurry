@@ -160,7 +160,10 @@ void esp_hidd_send_consumer_value(uint16_t conn_id, uint8_t key_cmd, bool key_pr
 
 void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask, uint8_t *keyboard_cmd, uint8_t num_key);
 
-void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y);
+/* 16-bit relative axes: at 8 bits a fast flick saturates at 127 units per
+   report and the pointer visibly lags the hand. */
+void esp_hidd_send_mouse_report(uint16_t conn_id, uint8_t buttons,
+                                int16_t dx, int16_t dy, int8_t wheel, int8_t pan);
 
 #ifdef __cplusplus
 }

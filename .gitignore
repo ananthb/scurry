@@ -3,10 +3,8 @@
 result
 result-*
 .direnv
-/firmware/**/.embuild
-/firmware/**/target
 .cargo-tools
-/spike/**/build
-/spike/**/sdkconfig
-/spike/**/sdkconfig.old
-/spike/**/managed_components
+/firmware/**/build
+/firmware/**/sdkconfig
+/firmware/**/sdkconfig.old
+/firmware/**/managed_components

@@ -8,3 +8,14 @@ repository.workspace = true
 
 [dependencies]
 scurry-proto.workspace = true
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Sets the tty to raw mode. Without that the line discipline would translate
+# bytes inside our binary frames -- 0x0A in a coordinate becoming CRLF would
+# silently corrupt pointer motion.
+serialport = "4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"

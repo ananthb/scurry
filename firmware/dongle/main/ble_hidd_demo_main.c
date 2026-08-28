@@ -26,6 +26,7 @@
 #include "esp_bt_device.h"
 #include "driver/gpio.h"
 #include "hid_dev.h"
+#include "driver/usb_serial_jtag.h"
 
 /**
  * Brief:
@@ -225,25 +226,144 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
 }
 
-void hid_demo_task(void *pvParameters)
+/* ---------------------------------------------------------------------------
+ * scurry frame reader
+ *
+ * The controller writes 16-byte scurry frames at us over USB Serial/JTAG. This
+ * is the SECOND implementation of that wire format -- crates/scurry-proto is
+ * the first, in Rust. They must not drift. doc/protocol.md is the normative
+ * description; golden vectors in the Rust crate's tests pin the byte layout.
+ *
+ * Logs flow the other way on the same CDC pipe. That is fine: it is full
+ * duplex, the host writes binary and reads text.
+ * ------------------------------------------------------------------------- */
+
+#define SCURRY_MAGIC        0x53
+#define SCURRY_VERSION      1
+#define SCURRY_FRAME_LEN    16
+
+#define SCURRY_KIND_MOUSE   1
+#define SCURRY_KIND_ENTER   2
+#define SCURRY_KIND_LEAVE   3
+#define SCURRY_KIND_PING    4
+#define SCURRY_KIND_PONG    5
+
+static bool     scurry_seq_seen = false;
+static uint16_t scurry_seq_last = 0;
+
+/* Sequence numbers wrap at u16, so "newer" is signed distance on the wrapped
+   circle, not `>`. A naive comparison would stall the pointer for 32k frames
+   every time the counter wrapped. Mirrors SeqGate in scurry-proto. */
+static bool scurry_seq_accept(uint16_t seq)
 {
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    while(1) {
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-        if (sec_conn) {
-            ESP_LOGI(HID_DEMO_TAG, "Send the volume");
-            send_volum_up = true;
-            //uint8_t key_vaule = {HID_KEY_A};
-            //esp_hidd_send_keyboard_value(hid_conn_id, 0, &key_vaule, 1);
-            esp_hidd_send_consumer_value(hid_conn_id, HID_CONSUMER_VOLUME_UP, true);
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
-            if (send_volum_up) {
-                send_volum_up = false;
-                esp_hidd_send_consumer_value(hid_conn_id, HID_CONSUMER_VOLUME_UP, false);
-                esp_hidd_send_consumer_value(hid_conn_id, HID_CONSUMER_VOLUME_DOWN, true);
-                vTaskDelay(3000 / portTICK_PERIOD_MS);
-                esp_hidd_send_consumer_value(hid_conn_id, HID_CONSUMER_VOLUME_DOWN, false);
+    if (!scurry_seq_seen) {
+        scurry_seq_seen = true;
+        scurry_seq_last = seq;
+        return true;
+    }
+    int16_t delta = (int16_t)(seq - scurry_seq_last);
+    if (delta > 0) {
+        scurry_seq_last = seq;
+        return true;
+    }
+    return false;
+}
+
+/* Map a scurry node id onto a live BLE connection. Node ids index the
+   connection table in bond order; -1 means that target is not connected. */
+static int scurry_conn_for_node(uint8_t node)
+{
+    /* Node 0 is the controller's own screen. The controller never transmits
+       it, so node N addresses connection slot N-1. Keeping 0 reserved means a
+       zeroed or truncated frame cannot accidentally address a real target. */
+    if (node == 0 || node > SCURRY_MAX_HOSTS) {
+        return -1;
+    }
+    uint8_t slot = node - 1;
+    return scurry_conn_used[slot] ? (int)scurry_conns[slot] : -1;
+}
+
+static void scurry_handle_frame(const uint8_t *f)
+{
+    uint8_t  kind = f[2];
+    uint8_t  node = f[3];
+    uint16_t seq  = (uint16_t)f[4] | ((uint16_t)f[5] << 8);
+
+    if (!scurry_seq_accept(seq)) {
+        return; /* reordered straggler */
+    }
+
+    int conn = scurry_conn_for_node(node);
+    if (conn < 0 && kind != SCURRY_KIND_PING) {
+        return; /* nothing bonded on that slot yet */
+    }
+
+    switch (kind) {
+    case SCURRY_KIND_MOUSE: {
+        uint8_t buttons = f[6];
+        int16_t dx = (int16_t)((uint16_t)f[8]  | ((uint16_t)f[9]  << 8));
+        int16_t dy = (int16_t)((uint16_t)f[10] | ((uint16_t)f[11] << 8));
+        int8_t  wheel = (int8_t)f[12];
+        int8_t  pan   = (int8_t)f[13];
+        esp_hidd_send_mouse_report((uint16_t)conn, buttons, dx, dy, wheel, pan);
+        break;
+    }
+    case SCURRY_KIND_LEAVE:
+        /* Release everything. A drag that crosses a screen boundary must not
+           strand a held button on the machine being departed. */
+        esp_hidd_send_mouse_report((uint16_t)conn, 0, 0, 0, 0, 0);
+        break;
+    case SCURRY_KIND_ENTER:
+        ESP_LOGI(HID_DEMO_TAG, "scurry: enter node=%d edge=%d", node, f[6]);
+        break;
+    case SCURRY_KIND_PING:
+        ESP_LOGI(HID_DEMO_TAG, "scurry: ping seq=%u, %d host(s)", seq, scurry_conn_count());
+        break;
+    default:
+        break;
+    }
+}
+
+void scurry_reader_task(void *pvParameters)
+{
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    cfg.rx_buffer_size = 1024;
+    cfg.tx_buffer_size = 1024;
+    if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
+        ESP_LOGE(HID_DEMO_TAG, "scurry: usb_serial_jtag driver install failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(HID_DEMO_TAG, "scurry: reading frames from USB Serial/JTAG");
+
+    static uint8_t buf[SCURRY_FRAME_LEN * 8];
+    size_t filled = 0;
+
+    while (1) {
+        int n = usb_serial_jtag_read_bytes(buf + filled, sizeof(buf) - filled,
+                                           20 / portTICK_PERIOD_MS);
+        if (n <= 0) {
+            continue;
+        }
+        filled += (size_t)n;
+
+        size_t off = 0;
+        while (filled - off >= SCURRY_FRAME_LEN) {
+            /* Resynchronise byte-by-byte on the magic. A dropped or spurious
+               byte otherwise desynchronises the stream permanently. */
+            if (buf[off] != SCURRY_MAGIC || buf[off + 1] != SCURRY_VERSION) {
+                off++;
+                continue;
             }
+            scurry_handle_frame(buf + off);
+            off += SCURRY_FRAME_LEN;
+        }
+        /* Keep the unconsumed tail. */
+        if (off > 0) {
+            memmove(buf, buf + off, filled - off);
+            filled -= off;
+        } else if (filled == sizeof(buf)) {
+            filled = 0; /* no magic anywhere in a full buffer: drop it */
         }
     }
 }
@@ -312,5 +432,5 @@ void app_main(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
 
-    xTaskCreate(&hid_demo_task, "hid_task", 2048, NULL, 5, NULL);
+    xTaskCreate(&scurry_reader_task, "scurry_rx", 4096, NULL, 5, NULL);
 }

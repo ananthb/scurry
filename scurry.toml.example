@@ -1,0 +1,24 @@
+# The virtual desktop. Screens are rectangles in one shared coordinate space;
+# whichever contains the pointer holds focus. They need not tile the plane --
+# the pointer clamps rather than falling into a gap.
+
+# device = "/dev/cu.usbmodem2101"   # autodetected when omitted
+
+# Node 0 is this machine. Input stays local and is never transmitted.
+[[screen]]
+name = "mac"
+node = 0
+x = 0
+y = 0
+width = 3024
+height = 1964
+
+# Remote screens are 1..=4, mapping onto the dongle's bonded connection slots
+# in bond order. Placed to the right of the Mac, vertically centred against it.
+[[screen]]
+name = "linux"
+node = 1
+x = 3024
+y = 262
+width = 2560
+height = 1440
