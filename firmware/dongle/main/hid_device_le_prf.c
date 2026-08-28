@@ -548,7 +548,7 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 {
     switch(event) {
         case ESP_GATTS_REG_EVT: {
-            esp_ble_gap_config_local_icon (ESP_BLE_APPEARANCE_GENERIC_HID);
+            esp_ble_gap_config_local_icon (ESP_BLE_APPEARANCE_HID_MOUSE);
             esp_hidd_cb_param_t hidd_param;
             hidd_param.init_finish.state = param->reg.status;
             if(param->reg.app_id == HIDD_APP_ID) {

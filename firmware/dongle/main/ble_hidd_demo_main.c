@@ -102,11 +102,11 @@ static bool send_volum_up = false;
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
 
-/* Advertised as "scurry XXXX", where XXXX is derived from this board's BT MAC.
+/* Advertised as "Scurry XXXX", where XXXX is derived from this board's BT MAC.
    Stable across reboots and reflashes, distinct per board, so several dongles
    are tellable apart in a Bluetooth picker. Filled in by
    scurry_make_device_name() before the name is ever set. */
-static char HIDD_DEVICE_NAME[16] = "scurry";
+static char HIDD_DEVICE_NAME[16] = "Scurry";
 
 static void scurry_make_device_name(void)
 {
@@ -135,7 +135,7 @@ static void scurry_make_device_name(void)
     }
     id[4] = '\0';
 
-    snprintf(HIDD_DEVICE_NAME, sizeof(HIDD_DEVICE_NAME), "scurry %s", id);
+    snprintf(HIDD_DEVICE_NAME, sizeof(HIDD_DEVICE_NAME), "Scurry %s", id);
     ESP_LOGI(HID_DEMO_TAG, "scurry: advertising as \"%s\" (mac %02x:%02x:%02x:%02x:%02x:%02x)",
              HIDD_DEVICE_NAME, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
@@ -151,7 +151,13 @@ static esp_ble_adv_data_t hidd_adv_data = {
     .include_txpower = true,
     .min_interval = 0x0006, //slave connection min interval, Time = min_interval * 1.25 msec
     .max_interval = 0x0010, //slave connection max interval, Time = max_interval * 1.25 msec
-    .appearance = 0x03c0,       //HID Generic,
+    /* 0x03C2 = HID Mouse. Was 0x03C0 (Generic HID), which leaves the host to
+       pick an icon for an unknown HID device -- ChromeOS renders that as a game
+       controller. Must match the GAP local icon set in hid_device_le_prf.c:
+       hosts differ over whether they trust the advertisement or the connected
+       device's GAP service, and a mismatch shows one icon while scanning and
+       another once paired. */
+    .appearance = ESP_BLE_APPEARANCE_HID_MOUSE,
     .manufacturer_len = 0,
     .p_manufacturer_data =  NULL,
     .service_data_len = 0,
