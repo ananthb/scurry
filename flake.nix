@@ -8,9 +8,14 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    # Provides ESP-IDF and the riscv32 toolchain as derivations, so the C spike
+    # needs no imperative clone into ~/esp and no install.sh writing to
+    # ~/.espressif. Its nixpkgs is deliberately NOT followed: it pins versions
+    # its prebuilt Espressif toolchains are known to work against.
+    nixpkgs-esp-dev.url = "github:mirrexagon/nixpkgs-esp-dev";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, nixpkgs-esp-dev }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -49,6 +54,21 @@
           # on macOS. Those come from the darwin stdenv's apple-sdk now; the old
           # darwin.apple_sdk.frameworks.* stubs were removed from nixpkgs.
 
+        };
+
+        # Kept separate from the default shell: ESP-IDF plus its toolchain is a
+        # large closure, and the host crates never need it.
+        # ESP-IDF comes from nixpkgs-esp-dev's OWN package set, not via its
+        # overlay applied to ours: the overlay wants python310, which unstable
+        # has dropped. Taking the prebuilt package sidesteps that entirely.
+        #
+        # Kept out of the default shell because the IDF closure is large and the
+        # host crates never need it.
+        devShells.esp = pkgs.mkShell {
+          packages = [
+            nixpkgs-esp-dev.packages.${system}.esp-idf-riscv
+            pkgs.espflash
+          ];
         };
 
         packages.default = pkgs.rustPlatform.buildRustPackage {

@@ -6,3 +6,7 @@ result-*
 /firmware/**/.embuild
 /firmware/**/target
 .cargo-tools
+/spike/**/build
+/spike/**/sdkconfig
+/spike/**/sdkconfig.old
+/spike/**/managed_components

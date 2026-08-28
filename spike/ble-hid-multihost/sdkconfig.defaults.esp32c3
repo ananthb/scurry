@@ -1,0 +1,22 @@
+# This file was generated using idf.py save-defconfig. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
+#
+CONFIG_IDF_TARGET="esp32c3"
+CONFIG_BT_ENABLED=y
+# CONFIG_BT_BLE_50_FEATURES_SUPPORTED is not set
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+
+# scurry spike: hold concurrent bonded HID links to several targets at once.
+# This is the claim the whole architecture rests on.
+CONFIG_BT_ACL_CONNECTIONS=4
+CONFIG_BT_GATTS_MAX_NUM_HANDLE_PRF_APP=16
+
+# Persist bonds so targets pair once, not on every boot.
+CONFIG_BT_BLE_SMP_ENABLE=y
+
+# This board exposes only USB Serial/JTAG -- there is no UART bridge. The
+# default console routes to UART0, so every log line was going to pins nothing
+# is connected to. Without this the spike is unobservable.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
