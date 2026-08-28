@@ -27,6 +27,7 @@
 #include "driver/gpio.h"
 #include "hid_dev.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_mac.h"
 
 /**
  * Brief:
@@ -101,7 +102,43 @@ static bool send_volum_up = false;
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
 
-#define HIDD_DEVICE_NAME            "HID"
+/* Advertised as "scurry XXXX", where XXXX is derived from this board's BT MAC.
+   Stable across reboots and reflashes, distinct per board, so several dongles
+   are tellable apart in a Bluetooth picker. Filled in by
+   scurry_make_device_name() before the name is ever set. */
+static char HIDD_DEVICE_NAME[16] = "scurry";
+
+static void scurry_make_device_name(void)
+{
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_BT) != ESP_OK) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: no BT MAC, name stays %s", HIDD_DEVICE_NAME);
+        return;
+    }
+
+    /* FNV-1a over all six bytes rather than just printing the tail. Espressif's
+       OUI occupies the first three, so slicing the MAC directly would leave
+       boards differing only in the last character or two. Hashing spreads the
+       difference across every position. */
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) {
+        h ^= mac[i];
+        h *= 16777619u;
+    }
+
+    /* Crockford base32: no I, L, O or U, so the id cannot be misread or
+       mistyped when someone reads it off a screen. 4 chars = 20 bits. */
+    static const char alpha[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    char id[5];
+    for (int i = 0; i < 4; i++) {
+        id[i] = alpha[(h >> (i * 5)) & 0x1F];
+    }
+    id[4] = '\0';
+
+    snprintf(HIDD_DEVICE_NAME, sizeof(HIDD_DEVICE_NAME), "scurry %s", id);
+    ESP_LOGI(HID_DEMO_TAG, "scurry: advertising as \"%s\" (mac %02x:%02x:%02x:%02x:%02x:%02x)",
+             HIDD_DEVICE_NAME, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 static uint8_t hidd_service_uuid128[] = {
     /* LSB <--------------------------------------------------------------------------------> MSB */
     //first uuid, 16bit, [12],[13] is the value
@@ -380,6 +417,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+
+    /* Before anything can advertise it. Reads efuse, so it is safe this early. */
+    scurry_make_device_name();
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
