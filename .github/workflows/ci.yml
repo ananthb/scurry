@@ -23,6 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # crates.io 403s any User-Agent starting with "curl/", and nixpkgs'
+          # fetchurl sends "curl/<ver> Nixpkgs/<ver>". NIX_CURL_FLAGS is appended
+          # after that flag so the later -A wins; the short form is joined to its
+          # value because impure-env splits on spaces. Without this, any crate not
+          # already in the cache fails to download.
+          extra-conf: |
+            impure-env = NIX_CURL_FLAGS=-ANixpkgs
       - uses: DeterminateSystems/magic-nix-cache-action@main
       # Runs clippy with -D warnings and the whole test suite. Both platforms,
       # because the capture layer is per-platform and only compiles on one of
@@ -34,6 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # crates.io 403s any User-Agent starting with "curl/", and nixpkgs'
+          # fetchurl sends "curl/<ver> Nixpkgs/<ver>". NIX_CURL_FLAGS is appended
+          # after that flag so the later -A wins; the short form is joined to its
+          # value because impure-env splits on spaces. Without this, any crate not
+          # already in the cache fails to download.
+          extra-conf: |
+            impure-env = NIX_CURL_FLAGS=-ANixpkgs
       - uses: DeterminateSystems/magic-nix-cache-action@main
       # The firmware links a Rust staticlib built for riscv32imc; building it
       # here catches ABI or toolchain drift that the host tests cannot see.
