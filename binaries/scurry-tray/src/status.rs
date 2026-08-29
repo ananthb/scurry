@@ -13,7 +13,7 @@ use scurry_ctl::ipc::{Client, DaemonState};
 use scurry_ctl::transport::Dongle;
 use scurry_proto::{kind, SlotStatus};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenInfo {
     pub name: String,
     pub node: u8,
@@ -22,7 +22,7 @@ pub struct ScreenInfo {
 }
 
 /// The three states worth distinguishing in the menu.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Snapshot {
     /// Nothing plugged in. An ordinary state, not a failure.
     NoDongle,

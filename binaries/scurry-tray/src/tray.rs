@@ -56,6 +56,13 @@ struct App {
     /// Most recent answer from the dongle. Written by a background poller so
     /// the menu never blocks on serial I/O.
     snapshot: Arc<Mutex<Snapshot>>,
+    /// What the menu was last built from.
+    ///
+    /// Replacing a tray menu dismisses it if the user has it open, so the poll
+    /// must not rebuild unconditionally -- doing that made the menu close the
+    /// moment it was opened, roughly every two seconds. Rebuild only when
+    /// something a person would see has actually changed.
+    rendered: Option<(Snapshot, bool)>,
     next_refresh: Instant,
 }
 
@@ -69,6 +76,7 @@ impl App {
             _tap: None,
             socket_started: false,
             snapshot: Arc::new(Mutex::new(Snapshot::NoDongle)),
+            rendered: None,
             next_refresh: Instant::now(),
         }
     }
@@ -192,10 +200,16 @@ impl App {
             }
         };
 
-        let menu = self.build_menu(&snap);
-        if let Some(tray) = &self.tray {
-            tray.set_menu(Some(Box::new(menu)));
-            let _ = tray.set_tooltip(Some(snap.tooltip()));
+        // login::enabled() reads the filesystem and is part of what the menu
+        // shows, so it belongs in the comparison.
+        let state = (snap, login::enabled());
+        if self.rendered.as_ref() != Some(&state) {
+            let menu = self.build_menu(&state.0);
+            if let Some(tray) = &self.tray {
+                tray.set_menu(Some(Box::new(menu)));
+                let _ = tray.set_tooltip(Some(state.0.tooltip()));
+            }
+            self.rendered = Some(state);
         }
         self.next_refresh = Instant::now() + REFRESH;
     }
@@ -254,6 +268,9 @@ impl ApplicationHandler for App {
                 }
                 _ => {}
             }
+            // A menu action changes what the menu should say, and the user has
+            // just dismissed it by clicking, so rebuilding now is safe.
+            self.rendered = None;
             self.refresh();
         }
 
