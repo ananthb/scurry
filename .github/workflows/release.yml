@@ -54,6 +54,7 @@ jobs:
           # value because impure-env splits on spaces. Without this, any crate not
           # already in the cache fails to download.
           extra-conf: |
+            extra-experimental-features = configurable-impure-env
             impure-env = NIX_CURL_FLAGS=-ANixpkgs
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
@@ -107,6 +108,7 @@ jobs:
           # value because impure-env splits on spaces. Without this, any crate not
           # already in the cache fails to download.
           extra-conf: |
+            extra-experimental-features = configurable-impure-env
             impure-env = NIX_CURL_FLAGS=-ANixpkgs
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
