@@ -24,6 +24,24 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils, nixpkgs-esp-dev, nix-appimage }:
+    # System-independent outputs first: a home-manager module is evaluated by
+    # the importing configuration, so it must not be nested per-system.
+    {
+      homeManagerModules.default = { config, lib, pkgs, ... }: {
+        imports = [ ./nix/home-module.nix ];
+        # mkDefault so an importing configuration can still substitute its own
+        # build, and guarded on enable so a disabled module does not force this
+        # flake's packages to be evaluated at all.
+        config = lib.mkIf config.services.scurry.enable {
+          services.scurry.package =
+            lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.scurry-tray;
+          services.scurry.ctlPackage =
+            lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.scurry-ctl;
+        };
+      };
+      homeManagerModules.scurry = self.homeManagerModules.default;
+    }
+    //
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
