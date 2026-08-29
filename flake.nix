@@ -78,6 +78,9 @@
           # libappindicator is what tray-icon falls back to on desktops without
           # a StatusNotifierItem host.
           libayatana-appindicator
+          # libayatana-indicator's pkg-config pulls in -lxdo transitively, so
+          # the link fails without it even though nothing here calls xdotool.
+          xdotool
           glib
           gtk3
         ];
