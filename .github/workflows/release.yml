@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Binaries are built by nix so the artifacts are reproducible and the macOS
+# bundle can be assembled the same way locally. The workflow only moves files
+# around and makes the GitHub release.
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A tag that disagrees with Cargo.toml produces a release whose binaries
+      # report a different version than the tag, which is confusing forever
+      # after. Fail before anything is published.
+      - name: Tag matches workspace version
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          ws_ver=$(awk -F\" '/^\[workspace\.package\]/{f=1} f && /^version *=/ {print $2; exit}' Cargo.toml)
+          if [[ "$tag_ver" != "$ws_ver" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME (=$tag_ver) does not match Cargo.toml version $ws_ver"
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME matches Cargo.toml version $ws_ver"
+
+  linux:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            system: x86_64-linux
+            appimage-arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            system: aarch64-linux
+            appimage-arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build tarball
+        run: |
+          nix build .#packages.${{ matrix.system }}.release -o result-tar -L
+          mkdir -p dist
+          cp -L "$(readlink result-tar)" "dist/scurry-${{ matrix.arch }}.tar.gz"
+
+      - name: Build AppImage
+        run: |
+          nix build .#packages.${{ matrix.system }}.appimage -o result-appimage -L
+          cp -L "$(readlink result-appimage)" \
+            "dist/scurry-tray-${{ matrix.appimage-arch }}.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+            system: aarch64-darwin
+          - runner: macos-13
+            arch: amd64
+            system: x86_64-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # The derivation rewrites /nix/store dylib paths and then fails the build
+      # if any survive, so a DMG that would not open on a stock Mac never
+      # reaches the release.
+      - name: Build DMG
+        run: |
+          nix build .#packages.${{ matrix.system }}.release -o result-dmg -L
+          mkdir -p dist
+          cp -L "$(readlink result-dmg)" "dist/scurry-macos-${{ matrix.arch }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Install
+
+            **macOS** — open the DMG, drag `scurry.app` to Applications, then run
+            `Install Daemon.command` from the DMG to register the LaunchAgent.
+            Grant Accessibility permission when asked: without it the pointer
+            cannot be captured.
+
+            **Linux** — the AppImage runs the tray directly. The tarball also
+            carries the systemd user unit, the desktop entry, and a udev rule
+            granting access to the dongle without adding yourself to `dialout`.
+
+            Binaries are unsigned. macOS will need `xattr -dr com.apple.quarantine
+            /Applications/scurry.app` on first run, or right-click → Open.

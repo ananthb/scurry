@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>scurry-tray</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.ananthb.scurry-tray</string>
+    <key>CFBundleName</key>
+    <string>scurry</string>
+    <key>CFBundleDisplayName</key>
+    <string>scurry</string>
+    <!-- Substituted from Cargo.toml at build time by the flake, so the bundle
+         version cannot drift from the crate version. -->
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <!-- Menu bar app: no Dock icon, no app switcher entry. Without this the
+         tray would also appear as a regular application, which is not what a
+         status item is. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>

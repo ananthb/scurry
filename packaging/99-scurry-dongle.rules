@@ -1,0 +1,9 @@
+# Grant the console user access to the scurry dongle without group membership.
+#
+# Espressif's USB Serial/JTAG bridge, which is what an ESP32-C3 presents when it
+# has no separate UART chip. uaccess hands the device to whoever is logged in at
+# the seat, which is the right scope: the daemon runs as that user.
+#
+# Install to /etc/udev/rules.d/99-scurry-dongle.rules, then:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", TAG+="uaccess"

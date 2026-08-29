@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ananthb.scurry</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/scurry.app/Contents/MacOS/scurry-ctl</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart only on abnormal exit. A clean exit is the user quitting on
+       purpose, and relaunching over that would make it impossible to stop. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/Library/Logs/scurry.log</string>
+  <key>StandardOutPath</key>
+  <string>HOME_DIR/Library/Logs/scurry.log</string>
+</dict>
+</plist>
