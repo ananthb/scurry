@@ -218,10 +218,20 @@ impl ApplicationHandler for App {
         // NSStatusItem needs an initialised NSApplication, and an icon created
         // earlier never appears.
         match icon() {
-            Ok(ic) => match TrayIconBuilder::new().with_tooltip("scurry").with_icon(ic).build() {
-                Ok(t) => self.tray = Some(t),
-                Err(e) => eprintln!("could not create tray icon: {e}"),
-            },
+            Ok(ic) => {
+                let builder = TrayIconBuilder::new().with_tooltip("scurry").with_icon(ic);
+                // A template image: macOS reads only the alpha channel and
+                // tints the glyph to match the menu bar, so it follows light
+                // and dark mode without shipping two icons. The asset is
+                // deliberately background-free -- a plate would be filled in
+                // solid and look nothing like the icons beside it.
+                #[cfg(target_os = "macos")]
+                let builder = builder.with_icon_as_template(true);
+                match builder.build() {
+                    Ok(t) => self.tray = Some(t),
+                    Err(e) => eprintln!("could not create tray icon: {e}"),
+                }
+            }
             Err(e) => eprintln!("could not load tray icon: {e}"),
         }
         self.refresh();
