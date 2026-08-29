@@ -46,6 +46,12 @@ in
     launchd.agents.scurry = lib.mkIf (cfg.autostart && pkgs.stdenv.hostPlatform.isDarwin) {
       enable = true;
       config = {
+        # Set explicitly. Without it home-manager derives the label from the
+        # attribute name -- org.nix-community.home.scurry -- which would not
+        # match the com.ananthb.scurry the app's own "Open at Login" item writes
+        # and that `launchctl bootout` targets. Two labels for one agent means
+        # the app cannot see or stop what home-manager installed.
+        Label = "com.ananthb.scurry";
         ProgramArguments = [ "${cfg.package}/bin/scurry-tray" ];
         RunAtLoad = true;
         # No KeepAlive. This is a UI app: relaunching it after the user quits
