@@ -116,23 +116,77 @@
           default = scurry-ctl;
           inherit scurry-ctl scurry-tray;
         }
-        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          release =
-            let arch = if system == "x86_64-linux" then "amd64" else "arm64";
-            in pkgs.runCommand "scurry-${arch}.tar.gz"
-              { nativeBuildInputs = [ pkgs.gzip pkgs.patchelf ]; } ''
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+          let
+            arch = if system == "x86_64-linux" then "amd64" else "arm64";
+
+            # Nix bakes an RPATH into /nix/store. On a machine without Nix the
+            # loader follows it, finds nothing, and the binary dies before main.
+            # Stripping it makes these behave like any other distro binary.
+            # Shared by the tarball and the packages so neither can be shipped
+            # with the RPATH still in it.
+            portableBins = pkgs.runCommand "scurry-bins-${arch}"
+              { nativeBuildInputs = [ pkgs.patchelf ]; } ''
+              mkdir -p $out
+              cp ${scurry-ctl}/bin/scurry-ctl $out/
+              cp ${scurry-tray}/bin/scurry-tray $out/
+              chmod +w $out/scurry-ctl $out/scurry-tray
+              patchelf --remove-rpath $out/scurry-ctl
+              patchelf --remove-rpath $out/scurry-tray
+              if readelf -d $out/scurry-tray | grep -q 'R\(UN\)\?PATH'; then
+                echo "ERROR: RPATH survived in scurry-tray" >&2
+                readelf -d $out/scurry-tray | grep 'R\(UN\)\?PATH' >&2
+                exit 1
+              fi
+            '';
+
+            # One nfpm config, built twice. nfpm maps the arch names itself, so
+            # deb gets amd64/arm64 and rpm gets x86_64/aarch64 without us
+            # spelling out either.
+            nfpmConfig = pkgs.writeText "nfpm.yaml" ''
+              name: scurry
+              arch: ${arch}
+              platform: linux
+              version: ${cargoVersion}
+              section: utils
+              priority: optional
+              maintainer: Ananth Bhaskararaman <antsub@gmail.com>
+              description: |
+                Share one mouse and keyboard across machines.
+                The pointer crosses a screen edge and lands on the next machine.
+                Targets need no software: they see an ordinary Bluetooth mouse.
+              vendor: ananthb
+              homepage: https://github.com/ananthb/scurry
+              license: MIT
+              contents:
+                - src: ${portableBins}/scurry-ctl
+                  dst: /usr/bin/scurry-ctl
+                - src: ${portableBins}/scurry-tray
+                  dst: /usr/bin/scurry-tray
+                - src: ${./packaging/scurry-tray.desktop}
+                  dst: /usr/share/applications/scurry-tray.desktop
+                - src: ${./assets/icon-256.png}
+                  dst: /usr/share/icons/hicolor/256x256/apps/scurry.png
+                - src: ${./assets/icon-128.png}
+                  dst: /usr/share/icons/hicolor/128x128/apps/scurry.png
+                # Without this the dongle is root-only on most distributions and
+                # the app silently finds nothing to talk to.
+                - src: ${./packaging/99-scurry-dongle.rules}
+                  dst: /usr/lib/udev/rules.d/99-scurry-dongle.rules
+            '';
+
+            mkPackage = format: ext: pkgs.runCommand "scurry-${arch}.${ext}"
+              { nativeBuildInputs = [ pkgs.nfpm ]; } ''
+              mkdir -p out
+              nfpm package --config ${nfpmConfig} --packager ${format} --target out/
+              mv out/* $out
+            '';
+          in
+          {
+            release = pkgs.runCommand "scurry-${arch}.tar.gz"
+              { nativeBuildInputs = [ pkgs.gzip ]; } ''
               mkdir -p scurry
-              cp ${scurry-ctl}/bin/scurry-ctl scurry/
-              cp ${scurry-tray}/bin/scurry-tray scurry/
-              chmod +w scurry/scurry-ctl scurry/scurry-tray
-
-              # Nix bakes an RPATH into /nix/store. On a machine without Nix the
-              # loader follows it, finds nothing, and the binary dies before
-              # main. Stripping it makes the binary use the system loader path
-              # like any other distro binary.
-              patchelf --remove-rpath scurry/scurry-ctl
-              patchelf --remove-rpath scurry/scurry-tray
-
+              cp ${portableBins}/scurry-ctl ${portableBins}/scurry-tray scurry/
               cp ${./packaging/scurry-tray.desktop} scurry/scurry-tray.desktop
               cp ${./packaging/99-scurry-dongle.rules} scurry/99-scurry-dongle.rules
               cp ${./scurry.toml.example} scurry/scurry.toml.example
@@ -140,12 +194,15 @@
               tar -czf $out scurry
             '';
 
-          appimage = nix-appimage.lib.${system}.mkAppImage {
-            program = "${scurry-tray}/bin/scurry-tray";
-            pname = "scurry-tray";
-            name = "scurry-tray-${if system == "x86_64-linux" then "x86_64" else "aarch64"}.AppImage";
-          };
-        }
+            deb = mkPackage "deb" "deb";
+            rpm = mkPackage "rpm" "rpm";
+
+            appimage = nix-appimage.lib.${system}.mkAppImage {
+              program = "${scurry-tray}/bin/scurry-tray";
+              pname = "scurry-tray";
+              name = "scurry-tray-${if system == "x86_64-linux" then "x86_64" else "aarch64"}.AppImage";
+            };
+          })
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
           release =
             let arch = if system == "x86_64-darwin" then "amd64" else "arm64";

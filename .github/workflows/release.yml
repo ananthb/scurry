@@ -55,6 +55,15 @@ jobs:
           mkdir -p dist
           cp -L "$(readlink result-tar)" "dist/scurry-${{ matrix.arch }}.tar.gz"
 
+      # deb and rpm come from one nfpm config; nfpm maps the architecture names
+      # per format, so we do not spell out x86_64 versus amd64.
+      - name: Build deb and rpm
+        run: |
+          nix build .#packages.${{ matrix.system }}.deb -o result-deb -L
+          nix build .#packages.${{ matrix.system }}.rpm -o result-rpm -L
+          cp -L "$(readlink result-deb)" "dist/scurry-${{ matrix.arch }}.deb"
+          cp -L "$(readlink result-rpm)" "dist/scurry-${{ matrix.arch }}.rpm"
+
       - name: Build AppImage
         run: |
           nix build .#packages.${{ matrix.system }}.appimage -o result-appimage -L
@@ -103,6 +112,11 @@ jobs:
   release:
     needs: [linux, macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Keyless cosign signing exchanges this token for a short-lived
+      # certificate, so there is no private key to store or rotate.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -115,6 +129,19 @@ jobs:
           cd artifacts
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Only SHA256SUMS is signed. Verifying one signature and then checking
+      # the manifest covers every artifact, which is cheaper for us and simpler
+      # for anyone verifying than a signature per file.
+      - name: Sign the checksum manifest
+        run: |
+          cd artifacts
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -133,5 +160,23 @@ jobs:
             carries the systemd user unit, the desktop entry, and a udev rule
             granting access to the dongle without adding yourself to `dialout`.
 
-            Binaries are unsigned. macOS will need `xattr -dr com.apple.quarantine
-            /Applications/scurry.app` on first run, or right-click → Open.
+            **Linux** — `.deb` and `.rpm` install the binaries, the desktop
+            entry, and a udev rule granting access to the dongle. The AppImage
+            runs the tray without installing anything.
+
+            ## Verifying
+
+            `SHA256SUMS` is signed with cosign, keyless:
+
+            ```
+            cosign verify-blob --certificate SHA256SUMS.pem \
+              --signature SHA256SUMS.sig \
+              --certificate-identity-regexp 'https://github.com/ananthb/scurry/.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              SHA256SUMS
+            sha256sum -c SHA256SUMS
+            ```
+
+            The binaries themselves are not code-signed. macOS needs
+            `xattr -dr com.apple.quarantine /Applications/scurry.app` on first
+            run, or right-click → Open.
