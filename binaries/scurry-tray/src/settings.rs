@@ -16,11 +16,11 @@ pub fn run() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 460.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_title("scurry settings"),
+            .with_title("Scurry"),
         ..Default::default()
     };
     eframe::run_native(
-        "scurry settings",
+        "Scurry",
         options,
         Box::new(|_cc| Ok(Box::new(SettingsApp::new()))),
     )
@@ -44,9 +44,25 @@ impl SettingsApp {
 
     fn load(&mut self) {
         match status::load_config() {
+            Ok(cfg) if cfg.screens.is_empty() => {
+                // Distinct from a successful load that happened to be empty:
+                // the dongle stores nothing, or what it stored no longer
+                // parses -- which is what a protocol change does to a layout
+                // written by an older firmware. Either way, saving from here
+                // fixes it, and saying so beats reporting "loaded 0".
+                self.screens = Vec::new();
+                self.message = Some(Err(
+                    "The dongle has no layout stored. Add your screens and save."
+                        .to_string(),
+                ));
+            }
             Ok(cfg) => {
+                let n = cfg.screens.len();
                 self.screens = cfg.screens;
-                self.message = Some(Ok(format!("Loaded {} screens", self.screens.len())));
+                self.message = Some(Ok(format!(
+                    "Loaded {n} screen{}",
+                    if n == 1 { "" } else { "s" }
+                )));
             }
             Err(e) => self.message = Some(Err(format!("{e}"))),
         }
