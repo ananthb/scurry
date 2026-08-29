@@ -43,6 +43,27 @@ in
     # macOS: a LaunchAgent, which is also how the app's own menu toggle would
     # register itself. Declaring it here means the same file is managed by the
     # generation rather than written at runtime.
+    # Copy the .app into ~/Applications on activation.
+    #
+    # home.file with recursive = true would make per-file symlinks, which macOS
+    # does not accept as a bundle. Copy the whole thing.
+    #
+    # This is also what gives scurry a stable identity for Accessibility: macOS
+    # grants that permission per binary, and a bare binary under
+    # /etc/profiles/per-user changes path with every generation, so the grant
+    # would be silently lost on each rebuild.
+    home.activation.scurry-app = lib.mkIf pkgs.stdenv.hostPlatform.isDarwin
+      (lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+        app_src="${cfg.package}/Applications/scurry.app"
+        app_dst="$HOME/Applications/scurry.app"
+        if [ -d "$app_src" ]; then
+          $DRY_RUN_CMD rm -rf "$app_dst"
+          $DRY_RUN_CMD cp -RL "$app_src" "$app_dst"
+          $DRY_RUN_CMD chmod -R u+w "$app_dst"
+          $DRY_RUN_CMD xattr -dr com.apple.quarantine "$app_dst" 2>/dev/null || true
+        fi
+      '');
+
     launchd.agents.scurry = lib.mkIf (cfg.autostart && pkgs.stdenv.hostPlatform.isDarwin) {
       enable = true;
       config = {
@@ -52,7 +73,13 @@ in
         # and that `launchctl bootout` targets. Two labels for one agent means
         # the app cannot see or stop what home-manager installed.
         Label = "com.ananthb.scurry";
-        ProgramArguments = [ "${cfg.package}/bin/scurry-tray" ];
+        # Launched from the bundle, not from the store path, so the process has
+        # the app's identity. Accessibility is granted per binary, and a store
+        # path changes on every rebuild -- the permission would have to be
+        # re-granted each time.
+        ProgramArguments = [
+          "${config.home.homeDirectory}/Applications/scurry.app/Contents/MacOS/scurry-tray"
+        ];
         RunAtLoad = true;
         # No KeepAlive. This is a UI app: relaunching it after the user quits
         # from the menu would make it impossible to stop.
