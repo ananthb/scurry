@@ -58,10 +58,14 @@
           rustc = hostToolchain;
         };
 
-        # winit and eframe need these at build and run time on Linux. Missing
-        # any of them shows up as a link error, or worse as a binary that builds
-        # and then cannot open a window on the user's machine.
-        linuxGuiDeps = with pkgs; [
+        # Needed at build and run time on Linux. Missing any of them shows up as
+        # a link error, or worse as a binary that builds and then cannot open a
+        # window on the user's machine.
+        linuxDeps = with pkgs; [
+          # serialport enumerates ports through libudev on Linux, so this is
+          # needed by the daemon as well as the GUI -- without it libudev-sys
+          # fails at build time, not at run time.
+          systemdLibs
           libxkbcommon
           wayland
           libGL
@@ -80,7 +84,7 @@
 
         nativeBuildInputs = with pkgs; [ pkg-config ]
           ++ lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
-        buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxGuiDeps;
+        buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxDeps;
 
         mkScurry = { pname, cargoBuildFlags }: hostRustPlatform.buildRustPackage {
           inherit pname cargoBuildFlags nativeBuildInputs buildInputs;
