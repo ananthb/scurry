@@ -213,7 +213,7 @@ pub fn install(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<Ca
 pub fn run(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> {
     let _tap = build(dongle, state)?;
     eprintln!("capturing; move the pointer off a screen edge to hand over");
-    unsafe { CFRunLoop::run_current() };
+    CFRunLoop::run_current();
     Ok(())
 }
 

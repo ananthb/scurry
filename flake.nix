@@ -35,12 +35,27 @@
         # Single source of truth so the flake cannot drift from a version bump.
         cargoVersion = (lib.importTOML ./Cargo.toml).workspace.package.version;
 
-        # Nightly because the firmware's std target, riscv32imc-esp-espidf, is
-        # tier 3: rustc knows the target spec but ships no std for it, so it must
-        # be built from source with -Zbuild-std. The host crates do not care.
+        # Nightly, for the firmware only: its std target riscv32imc-esp-espidf
+        # is tier 3, so rustc knows the target spec but ships no std for it and
+        # it must be built from source with -Zbuild-std.
         rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           targets = [ "riscv32imc-unknown-none-elf" ];
+        };
+
+        # Stable for everything shipped. Release binaries have no reason to ride
+        # on nightly just because the firmware does.
+        hostToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "clippy" "rustfmt" "rust-src" ];
+        };
+
+        # buildRustPackage otherwise uses nixpkgs' own rustc and cargo, which do
+        # not carry the extensions requested above -- so `cargo clippy` in the
+        # checks derivation failed with "no such command", despite clippy being
+        # named right there in the toolchain.
+        hostRustPlatform = pkgs.makeRustPlatform {
+          cargo = hostToolchain;
+          rustc = hostToolchain;
         };
 
         # winit and eframe need these at build and run time on Linux. Missing
@@ -67,7 +82,7 @@
           ++ lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
         buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxGuiDeps;
 
-        mkScurry = { pname, cargoBuildFlags }: pkgs.rustPlatform.buildRustPackage {
+        mkScurry = { pname, cargoBuildFlags }: hostRustPlatform.buildRustPackage {
           inherit pname cargoBuildFlags nativeBuildInputs buildInputs;
           version = cargoVersion;
           src = ./.;
@@ -273,7 +288,7 @@
             '';
         };
 
-        checks.workspace = pkgs.rustPlatform.buildRustPackage {
+        checks.workspace = hostRustPlatform.buildRustPackage {
           pname = "scurry-checks";
           version = cargoVersion;
           src = ./.;

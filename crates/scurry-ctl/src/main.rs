@@ -170,7 +170,7 @@ fn status() -> Result<()> {
     // "connected", not "bonded": this is the dongle's live connection
     // table. Bonds persist in NVS across a reboot, connections do not, so a
     // freshly reset dongle shows nothing here until a host reconnects.
-    println!("{:<6} {:<11} {}", "node", "connected", "address");
+    println!("{:<6} {:<11} address", "node", "connected");
     for i in 0..count {
         let off = 1 + i * SlotStatus::WIRE_LEN;
         let Some(s) = msg.payload.get(off..).and_then(SlotStatus::decode) else {

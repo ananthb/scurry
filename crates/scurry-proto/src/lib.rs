@@ -54,6 +54,15 @@ pub const NAME_LEN: usize = 16;
 /// Bytes one screen occupies on the wire: node, name, geometry, peer address.
 pub const SCREEN_WIRE_LEN: usize = 1 + NAME_LEN + 16 + 6;
 
+/// Bytes the largest legal config occupies: a count byte, then every screen.
+pub const MAX_CONFIG_PAYLOAD: usize = 1 + MAX_SCREENS * SCREEN_WIRE_LEN;
+
+// It must fit in one payload, or the largest legal config could never be sent
+// at all. Checked at compile time rather than in a test: a wire format that
+// cannot carry its own maximum should fail the build, not wait for someone to
+// run the suite.
+const _: () = assert!(MAX_CONFIG_PAYLOAD <= MAX_PAYLOAD);
+
 pub mod button {
     pub const LEFT: u8 = 1 << 0;
     pub const RIGHT: u8 = 1 << 1;
@@ -462,13 +471,6 @@ mod tests {
             Header::decode(&big),
             Err(DecodeError::Oversized((MAX_PAYLOAD + 1) as u16))
         );
-    }
-
-    #[test]
-    fn a_full_config_payload_fits() {
-        // MAX_SCREENS screens plus the count byte must fit MAX_PAYLOAD, or the
-        // largest legal config could never be sent.
-        assert!(1 + MAX_SCREENS * SCREEN_WIRE_LEN <= MAX_PAYLOAD);
     }
 
     #[test]
