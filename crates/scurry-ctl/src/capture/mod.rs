@@ -1,5 +1,7 @@
 //! Reading local input, per platform.
 
+pub mod keymap;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 

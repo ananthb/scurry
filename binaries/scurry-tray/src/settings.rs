@@ -96,6 +96,7 @@ impl eframe::App for SettingsApp {
                         width: 1920,
                         height: 1080,
                         address: None,
+                        input: None,
                     });
                 }
             });
@@ -148,6 +149,42 @@ impl eframe::App for SettingsApp {
                                 }
                                 if screen.address.is_none() {
                                     ui.label("unpinned — first to connect");
+                                }
+                            });
+                        }
+                        if screen.node != 0 {
+                            ui.horizontal(|ui| {
+                                let mut input = screen.input.clone().unwrap_or_default();
+                                let mut swap = input.modifiers.as_deref() == Some("swap-gui-ctrl");
+                                let before = (swap, input.mouse_scale, input.natural_scroll);
+
+                                ui.label("Input");
+                                ui.checkbox(&mut swap, "Cmd → Ctrl")
+                                    .on_hover_text(
+                                        "Send Ctrl where this Mac sends Cmd, so shortcuts work \
+                                         on a PC-style target.",
+                                    );
+                                ui.checkbox(&mut input.natural_scroll, "Invert scroll");
+                                let mut scale = input.mouse_scale.unwrap_or(100);
+                                ui.label("Speed");
+                                ui.add(
+                                    egui::DragValue::new(&mut scale)
+                                        .suffix("%")
+                                        .range(10..=400),
+                                );
+
+                                input.mouse_scale = (scale != 100).then_some(scale);
+                                input.modifiers = swap.then(|| "swap-gui-ctrl".to_string());
+                                if before != (swap, input.mouse_scale, input.natural_scroll) {
+                                    // Drop the whole table once it says nothing,
+                                    // so the stored config stays minimal.
+                                    let empty = !swap
+                                        && input.mouse_scale.is_none()
+                                        && !input.natural_scroll
+                                        && !input.invert_x
+                                        && !input.invert_y
+                                        && !input.swap_buttons;
+                                    screen.input = (!empty).then_some(input);
                                 }
                             });
                         }

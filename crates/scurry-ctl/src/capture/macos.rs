@@ -25,8 +25,9 @@ use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     EventField,
 };
-use scurry_proto::{button, kind, MouseState};
+use scurry_proto::{button, kind, modifier, KeyState, MouseState};
 
+use crate::capture::keymap;
 use crate::ipc::DaemonState;
 use crate::transport::Dongle;
 
@@ -188,6 +189,64 @@ fn clamp_i16(v: i64) -> i16 {
 /// callback does not need the connection lock just to update a bitmask.
 static BUTTONS: AtomicU8 = AtomicU8::new(0);
 
+/// Keys currently held, as HID usage codes.
+///
+/// Tracked here rather than derived per event because HID reports the whole set
+/// every time: a report naming only the newest key would release everything
+/// else the moment a second key went down.
+static HELD: Mutex<[u8; 6]> = Mutex::new([0u8; 6]);
+
+/// Translate macOS's modifier flags into the HID modifier byte.
+///
+/// The flags do not distinguish left from right, so everything maps to the left
+/// variant. Targets treat them identically for shortcuts, and the alternative
+/// -- tracking FlagsChanged keycodes to tell the sides apart -- buys nothing a
+/// user would notice.
+fn modifiers_from(flags: core_graphics::event::CGEventFlags) -> u8 {
+    use core_graphics::event::CGEventFlags as F;
+    let mut m = 0u8;
+    if flags.contains(F::CGEventFlagShift) {
+        m |= modifier::LSHIFT;
+    }
+    if flags.contains(F::CGEventFlagControl) {
+        m |= modifier::LCTRL;
+    }
+    if flags.contains(F::CGEventFlagAlternate) {
+        m |= modifier::LALT;
+    }
+    if flags.contains(F::CGEventFlagCommand) {
+        m |= modifier::LGUI;
+    }
+    m
+}
+
+/// Record a key going down or coming up. Returns false if nothing changed, so
+/// autorepeat does not flood the link with identical reports.
+fn track_key(usage: u8, pressed: bool) -> bool {
+    let Ok(mut held) = HELD.lock() else { return false };
+    if pressed {
+        if held.contains(&usage) {
+            return false; // already down: this is autorepeat
+        }
+        if let Some(slot) = held.iter_mut().find(|k| **k == 0) {
+            *slot = usage;
+            return true;
+        }
+        // Six keys is what the boot protocol report carries. Beyond that the
+        // press is dropped rather than evicting a key that is genuinely held.
+        false
+    } else if let Some(slot) = held.iter_mut().find(|k| **k == usage) {
+        *slot = 0;
+        true
+    } else {
+        false
+    }
+}
+
+fn current_keys() -> [u8; 6] {
+    HELD.lock().map(|h| *h).unwrap_or([0u8; 6])
+}
+
 /// Opaque handle keeping capture alive. Dropping it stops input capture.
 ///
 /// Aliased so callers do not need core-graphics in their own dependency list
@@ -267,6 +326,11 @@ fn build(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<CaptureH
         CGEventType::OtherMouseDown,
         CGEventType::OtherMouseUp,
         CGEventType::ScrollWheel,
+        CGEventType::KeyDown,
+        CGEventType::KeyUp,
+        // Modifier presses arrive as FlagsChanged, not KeyDown, so without this
+        // a bare Cmd or Shift would never reach the target.
+        CGEventType::FlagsChanged,
     ];
 
     let tap = CGEventTap::new(
@@ -304,6 +368,43 @@ fn build(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<CaptureH
                 let loc = event.location();
                 LAST_X.store(loc.x as i32, Ordering::Relaxed);
                 LAST_Y.store(loc.y as i32, Ordering::Relaxed);
+            }
+
+            // Keyboard is a separate message and returns early: it shares only
+            // the swallow decision with the pointer path.
+            if matches!(
+                event_type,
+                CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+            ) {
+                let remote = REMOTE.load(Ordering::Relaxed);
+                if remote {
+                    let vk = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    let changed = match (event_type, keymap::hid_usage(vk)) {
+                        (CGEventType::KeyDown, Some(u)) => track_key(u, true),
+                        (CGEventType::KeyUp, Some(u)) => track_key(u, false),
+                        // FlagsChanged carries no keycode worth sending; the
+                        // modifier byte below already reflects it.
+                        (CGEventType::FlagsChanged, _) => true,
+                        _ => false,
+                    };
+                    if changed {
+                        let ks = KeyState {
+                            modifiers: modifiers_from(event.get_flags()),
+                            keys: current_keys(),
+                        };
+                        if let Ok(mut link) = tap_link.lock() {
+                            let _ = link.send(kind::KEY, &ks.encode());
+                        }
+                    }
+                    hold_cursor();
+                    return None; // typing belongs to the other machine
+                }
+                // Local: forget anything we thought was held, so returning from
+                // a remote screen does not leave a phantom key down there.
+                if let Ok(mut held) = HELD.lock() {
+                    *held = [0u8; 6];
+                }
+                return Some(event.clone());
             }
 
             let mut state = MouseState::default();

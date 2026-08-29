@@ -331,6 +331,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_MAX_PAYLOAD  256
 
 #define SCURRY_KIND_MOUSE       0x01
+#define SCURRY_KIND_KEY         0x02
 #define SCURRY_KIND_PING        0x04
 #define SCURRY_KIND_PONG        0x05
 #define SCURRY_KIND_FOCUS       0x06
@@ -524,6 +525,12 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
         int from_conn = scurry_conn_for_node(route.from);
         if (from_conn >= 0) {
             esp_hidd_send_mouse_report((uint16_t)from_conn, 0, 0, 0, 0, 0);
+            /* And every key. A modifier still held when focus moves sticks down
+               on a machine nobody is looking at, which is worse than a stuck
+               button: a held Cmd or Ctrl changes what every later keystroke
+               does over there. */
+            uint8_t none[6] = {0};
+            esp_hidd_send_keyboard_value((uint16_t)from_conn, 0, none, 0);
         }
         scurry_announce_focus(route.to);
 
@@ -566,14 +573,57 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
         return;
     }
 
-    /* Throttled: enough to tell "not sending" from "sending and ignored",
-       without flooding the link we are also using for messages. */
+    /* Apply this target's profile -- scaling, inversion, scroll direction,
+       button swap. The layout decides where input goes; the profile decides
+       what it looks like when it arrives. */
+    scurry_mouse_t m;
+    if (scurry_map_mouse(route.to, buttons, dx, dy, wheel, pan, &m) != 0) {
+        return;
+    }
+
     static uint32_t sent = 0;
     if ((sent++ % 120) == 0) {
         ESP_LOGI(HID_DEMO_TAG, "scurry: report -> node %d conn %d d(%d,%d) btn %02x",
-                 route.to, conn, dx, dy, buttons);
+                 route.to, conn, m.dx, m.dy, m.buttons);
     }
-    esp_hidd_send_mouse_report((uint16_t)conn, buttons, dx, dy, wheel, pan);
+    esp_hidd_send_mouse_report((uint16_t)conn, m.buttons, m.dx, m.dy, m.wheel, m.pan);
+}
+
+static void scurry_handle_key(const uint8_t *p, uint16_t len)
+{
+    if (len < 8) {
+        return;
+    }
+    /* Keyboard follows the pointer: there is one focus, and typing belongs to
+       whichever machine the user is looking at. */
+    uint8_t node = scurry_focus_node;
+    if (node == 0) {
+        return; /* the controller's own screen handles its own keys */
+    }
+    int conn = scurry_conn_for_node(node);
+    if (conn < 0) {
+        return;
+    }
+
+    uint8_t mods = scurry_map_modifiers(node, p[0]);
+
+    /* Compact the held keys. esp_hidd_send_keyboard_value takes a count rather
+       than a fixed array, and a zero in the middle is an empty slot, not a
+       keycode -- passing it through would report a phantom key. */
+    uint8_t keys[6] = {0};
+    uint8_t held = 0;
+    for (int i = 0; i < 6; i++) {
+        if (p[2 + i] != 0) {
+            keys[held++] = p[2 + i];
+        }
+    }
+
+    static uint32_t sent = 0;
+    if ((sent++ % 30) == 0) {
+        ESP_LOGI(HID_DEMO_TAG, "scurry: keys -> node %d mods %02x->%02x held %d",
+                 node, p[0], mods, held);
+    }
+    esp_hidd_send_keyboard_value((uint16_t)conn, mods, keys, held);
 }
 
 static void scurry_send_config(void)
@@ -695,6 +745,13 @@ static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, ui
             return;
         }
         scurry_handle_mouse(payload, len);
+        return;
+    }
+    if (kind == SCURRY_KIND_KEY) {
+        if (!scurry_seq_accept(seq)) {
+            return;
+        }
+        scurry_handle_key(payload, len);
         return;
     }
 

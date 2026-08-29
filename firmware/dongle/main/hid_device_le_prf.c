@@ -39,7 +39,20 @@ static hid_report_map_t hid_rpt_map[HID_NUM_REPORTS];
  * The keyboard comes back when keyboard support does, and will need testing on
  * each host rather than assuming a combo device is accepted.
  */
+/* Mouse (report 1) and keyboard (report 2).
+ *
+ * Written by hand rather than reusing Espressif's demo map. That one declared
+ * mouse, keyboard, consumer and vendor collections, and both ChromeOS and
+ * Android latched onto the keyboard and ignored the mouse entirely -- they were
+ * writing keyboard LED reports back to us while showing no pointer. Dropping to
+ * mouse-only fixed it, so the combo is the thing under suspicion.
+ *
+ * This map is deliberately minimal: two collections, no consumer page, no
+ * vendor page. If the pointer still works with a keyboard present, the demo
+ * map's extra collections were the problem rather than combos as such.
+ */
 static const uint8_t hidReportMap[] = {
+    /* ---- Mouse, report 1 ---- */
     0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x02,        // Usage (Mouse)
     0xA1, 0x01,        // Collection (Application)
@@ -53,7 +66,7 @@ static const uint8_t hidReportMap[] = {
     0x25, 0x01,        //     Logical Maximum (1)
     0x75, 0x01,        //     Report Size (1)
     0x95, 0x05,        //     Report Count (5)
-    0x81, 0x02,        //     Input (Data, Variable, Absolute) - 5 buttons
+    0x81, 0x02,        //     Input (Data, Variable, Absolute)
     0x75, 0x03,        //     Report Size (3)
     0x95, 0x01,        //     Report Count (1)
     0x81, 0x01,        //     Input (Constant) - pad the button byte
@@ -76,6 +89,43 @@ static const uint8_t hidReportMap[] = {
     0x95, 0x01,        //     Report Count (1)
     0x81, 0x06,        //     Input (Data, Variable, Relative) - horizontal pan
     0xC0,              //   End Collection
+    0xC0,              // End Collection
+
+    /* ---- Keyboard, report 2 ---- */
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x06,        // Usage (Keyboard)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x02,        //   Report Id (2)
+    0x05, 0x07,        //   Usage Page (Key Codes)
+    0x19, 0xE0,        //   Usage Minimum (Left Control)
+    0x29, 0xE7,        //   Usage Maximum (Right GUI)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x08,        //   Report Count (8)
+    0x81, 0x02,        //   Input (Data, Variable, Absolute) - modifiers
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x08,        //   Report Size (8)
+    0x81, 0x01,        //   Input (Constant) - reserved, required by boot proto
+    /* LED output report. Hosts write caps/num lock state here; without it some
+       refuse to treat the collection as a keyboard at all. */
+    0x95, 0x05,        //   Report Count (5)
+    0x75, 0x01,        //   Report Size (1)
+    0x05, 0x08,        //   Usage Page (LEDs)
+    0x19, 0x01,        //   Usage Minimum (Num Lock)
+    0x29, 0x05,        //   Usage Maximum (Kana)
+    0x91, 0x02,        //   Output (Data, Variable, Absolute)
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x03,        //   Report Size (3)
+    0x91, 0x01,        //   Output (Constant) - pad the LED byte
+    0x95, 0x06,        //   Report Count (6)
+    0x75, 0x08,        //   Report Size (8)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x65,        //   Logical Maximum (101)
+    0x05, 0x07,        //   Usage Page (Key Codes)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x29, 0x65,        //   Usage Maximum (101)
+    0x81, 0x00,        //   Input (Data, Array) - six concurrent keycodes
     0xC0,              // End Collection
 };
 

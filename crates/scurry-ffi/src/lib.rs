@@ -9,7 +9,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use scurry_layout::{Layout, Motion, Screen};
-use scurry_proto::{ScreenWire, MAX_SCREENS, SCREEN_WIRE_LEN};
+use scurry_proto::{mouse_flag, InputProfile, ScreenWire, MAX_SCREENS, SCREEN_WIRE_LEN};
 
 /// Result of feeding motion in, as seen from C.
 #[repr(C)]
@@ -60,6 +60,10 @@ static CONFIGURED: AtomicBool = AtomicBool::new(false);
 static mut PINS: [([u8; 6], u8); MAX_SCREENS] = [([0u8; 6], 0); MAX_SCREENS];
 static mut PIN_COUNT: usize = 0;
 
+/// Input profile per node id, indexed directly by node so a lookup is an array
+/// read on the hot path rather than a search.
+static mut PROFILES: [InputProfile; MAX_SCREENS] = [InputProfile::identity(); MAX_SCREENS];
+
 fn edge_to_wire(e: scurry_proto::Edge) -> u8 {
     match e {
         scurry_proto::Edge::Left => 0,
@@ -92,6 +96,9 @@ pub unsafe extern "C" fn scurry_layout_load(data: *const u8, len: usize) -> i32 
     }
 
     let mut screens = [Screen::new(0, "", 0, 0, 1, 1); MAX_SCREENS];
+    // Reset first: a node dropped from the layout must not keep the profile it
+    // had under the previous one.
+    PROFILES = [InputProfile::identity(); MAX_SCREENS];
     let mut pins = 0usize;
     for i in 0..count {
         let off = 1 + i * SCREEN_WIRE_LEN;
@@ -103,6 +110,9 @@ pub unsafe extern "C" fn scurry_layout_load(data: *const u8, len: usize) -> i32 
             return -5;
         }
         screens[i] = Screen::new(w.node, w.name_str(), w.x, w.y, w.width, w.height);
+        if (w.node as usize) < MAX_SCREENS {
+            PROFILES[w.node as usize] = w.profile;
+        }
         if w.is_pinned() {
             PINS[pins] = (w.bda, w.node);
             pins += 1;
@@ -152,10 +162,93 @@ pub unsafe extern "C" fn scurry_layout_save(out: *mut u8, cap: usize) -> i32 {
                 bda = *pinned;
             }
         }
-        let w = ScreenWire::pinned(s.node, s.name(), s.x, s.y, s.width, s.height, bda);
+        let mut w = ScreenWire::pinned(s.node, s.name(), s.x, s.y, s.width, s.height, bda);
+        // Carry the profile back out, or reading and rewriting the config
+        // through the settings pane would quietly reset every translation.
+        if (s.node as usize) < MAX_SCREENS {
+            w.profile = (*core::ptr::addr_of!(PROFILES))[s.node as usize];
+        }
         w.encode_into(&mut buf[1 + i * SCREEN_WIRE_LEN..]);
     }
     need as i32
+}
+
+/// A mouse report after the target's profile has been applied.
+#[repr(C)]
+pub struct ScurryMouse {
+    pub buttons: u8,
+    pub dx: i16,
+    pub dy: i16,
+    pub wheel: i8,
+    pub pan: i8,
+}
+
+fn profile_for(node: u8) -> InputProfile {
+    unsafe {
+        let profiles = &*core::ptr::addr_of!(PROFILES);
+        if (node as usize) < MAX_SCREENS {
+            profiles[node as usize]
+        } else {
+            InputProfile::identity()
+        }
+    }
+}
+
+/// Translate a mouse report for a target: pointer scaling, axis inversion,
+/// scroll direction, button swapping.
+///
+/// Done here rather than in C so the arithmetic stays in the crate the host
+/// tests cover.
+///
+/// # Safety
+/// `out` must point to a writable `ScurryMouse`.
+#[no_mangle]
+pub unsafe extern "C" fn scurry_map_mouse(
+    node: u8,
+    buttons: u8,
+    dx: i16,
+    dy: i16,
+    wheel: i8,
+    pan: i8,
+    out: *mut ScurryMouse,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let p = profile_for(node);
+    let (dx, dy) = p.map_motion(dx, dy);
+
+    let mut buttons = buttons;
+    if p.mouse_flags & mouse_flag::SWAP_BUTTONS != 0 {
+        let left = buttons & scurry_proto::button::LEFT != 0;
+        let right = buttons & scurry_proto::button::RIGHT != 0;
+        buttons &= !(scurry_proto::button::LEFT | scurry_proto::button::RIGHT);
+        if left {
+            buttons |= scurry_proto::button::RIGHT;
+        }
+        if right {
+            buttons |= scurry_proto::button::LEFT;
+        }
+    }
+
+    let invert = p.mouse_flags & mouse_flag::NATURAL_SCROLL != 0;
+    let (wheel, pan) = if invert {
+        (wheel.saturating_neg(), pan.saturating_neg())
+    } else {
+        (wheel, pan)
+    };
+
+    core::ptr::write(out, ScurryMouse { buttons, dx, dy, wheel, pan });
+    0
+}
+
+/// Translate a host modifier byte into the one this target expects.
+///
+/// This is what makes a Mac usable against a PC-style target: the host sends
+/// Cmd where Linux and ChromeOS want Ctrl.
+#[no_mangle]
+pub extern "C" fn scurry_map_modifiers(node: u8, host: u8) -> u8 {
+    profile_for(node).map_modifiers(host)
 }
 
 /// The node pinned to this Bluetooth address, or -1 if none is.

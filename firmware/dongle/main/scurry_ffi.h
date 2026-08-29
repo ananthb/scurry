@@ -37,6 +37,24 @@ int32_t scurry_layout_load(const uint8_t *data, size_t len);
    Returns bytes written, or negative on error. */
 int32_t scurry_layout_save(uint8_t *out, size_t cap);
 
+/* A mouse report after the target's input profile has been applied. */
+typedef struct {
+    uint8_t buttons;
+    int16_t dx;
+    int16_t dy;
+    int8_t  wheel;
+    int8_t  pan;
+} scurry_mouse_t;
+
+/* Apply a target's mouse profile: scaling, axis inversion, scroll direction,
+   button swapping. Kept in Rust so the arithmetic stays under host tests. */
+int32_t scurry_map_mouse(uint8_t node, uint8_t buttons, int16_t dx, int16_t dy,
+                         int8_t wheel, int8_t pan, scurry_mouse_t *out);
+
+/* Translate a host modifier byte into the one this target expects -- the Mac
+   sends Cmd where Linux and ChromeOS want Ctrl. */
+uint8_t scurry_map_modifiers(uint8_t node, uint8_t host);
+
 /* The node pinned to this Bluetooth address, or -1 if none is. Lets a
    reconnecting machine keep the same node id instead of taking whichever slot
    was free, which silently swapped screens across a reboot. */
