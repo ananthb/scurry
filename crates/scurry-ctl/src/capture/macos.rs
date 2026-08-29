@@ -27,6 +27,7 @@ use core_graphics::event::{
 };
 use scurry_proto::{button, kind, MouseState};
 
+use crate::ipc::DaemonState;
 use crate::transport::Dongle;
 
 #[repr(C)]
@@ -183,14 +184,26 @@ fn clamp_i16(v: i64) -> i16 {
     v.clamp(i16::MIN as i64, i16::MAX as i64) as i16
 }
 
+/// Held button state. An atomic rather than living beside the link, so the
+/// callback does not need the connection lock just to update a bitmask.
+static BUTTONS: AtomicU8 = AtomicU8::new(0);
+
 /// Capture local input and forward it to the dongle, forever.
-pub fn run(dongle: Dongle) -> Result<()> {
+///
+/// The link is shared with the control socket, which is why it arrives behind a
+/// mutex: the daemon owns the serial port exclusively, so the tray reaches the
+/// dongle by asking the daemon rather than opening the port itself.
+pub fn run(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> {
     install_cleanup();
 
     // The dongle owns the layout, so it must tell us where the pointer went;
     // we cannot work it out. A reader thread applies those announcements and
     // surfaces the firmware's log output, which shares this pipe.
-    let reader = dongle.try_clone()?;
+    let reader = {
+        let guard = dongle.lock().map_err(|_| anyhow!("dongle lock poisoned"))?;
+        guard.try_clone()?
+    };
+    let focus_state = Arc::clone(&state);
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut on_log = |line: &str| eprintln!("[dongle] {line}");
@@ -199,6 +212,7 @@ pub fn run(dongle: Dongle) -> Result<()> {
                 Ok(Some(msg)) if msg.kind == kind::FOCUS => {
                     if let Some(&node) = msg.payload.first() {
                         FOCUS.store(node, Ordering::Relaxed);
+                        focus_state.focus.store(node, Ordering::Relaxed);
                         set_remote(node != 0);
                         eprintln!("focus -> node {node}");
                     }
@@ -212,8 +226,7 @@ pub fn run(dongle: Dongle) -> Result<()> {
         }
     });
 
-    let shared = Arc::new(Mutex::new((dongle, 0u8))); // (link, button state)
-    let tap_state = Arc::clone(&shared);
+    let tap_link = Arc::clone(&dongle);
 
     let events = vec![
         CGEventType::MouseMoved,
@@ -260,12 +273,6 @@ pub fn run(dongle: Dongle) -> Result<()> {
                 return Some(event.clone());
             }
 
-            let mut guard = match tap_state.lock() {
-                Ok(g) => g,
-                Err(_) => return Some(event.clone()),
-            };
-            let (dongle, buttons) = &mut *guard;
-
             if !REMOTE.load(Ordering::Relaxed) {
                 let loc = event.location();
                 LAST_X.store(loc.x as i32, Ordering::Relaxed);
@@ -289,17 +296,21 @@ pub fn run(dongle: Dongle) -> Result<()> {
                         clamp_i16(event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y));
                     if let Some(bit) = button_bit(event_type, event) {
                         if is_press(event_type) {
-                            *buttons |= bit;
+                            BUTTONS.fetch_or(bit, Ordering::Relaxed);
                         } else {
-                            *buttons &= !bit;
+                            BUTTONS.fetch_and(!bit, Ordering::Relaxed);
                         }
                     }
                 }
             }
-            state.buttons = *buttons;
+            state.buttons = BUTTONS.load(Ordering::Relaxed);
 
-            let _ = dongle.send(kind::MOUSE, &state.encode());
-            drop(guard);
+            // Held only for the write. The control socket wants this lock too,
+            // and blocking a tray query behind pointer motion would make the
+            // settings window feel stuck.
+            if let Ok(mut link) = tap_link.lock() {
+                let _ = link.send(kind::MOUSE, &state.encode());
+            }
 
             // The invariant: exactly one machine consumes any given event.
             // Passing it through locally while the dongle is routing it to a

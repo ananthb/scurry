@@ -8,8 +8,8 @@ pub use macos::run;
 
 #[cfg(not(target_os = "macos"))]
 pub fn run(
-    _layout: crate::layout::Layout,
-    _transport: crate::transport::SerialTransport,
+    _dongle: std::sync::Arc<std::sync::Mutex<crate::transport::Dongle>>,
+    _state: std::sync::Arc<crate::ipc::DaemonState>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("input capture is only implemented for macOS so far")
 }

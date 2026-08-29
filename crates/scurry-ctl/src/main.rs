@@ -83,7 +83,23 @@ fn ack_name(code: u8) -> &'static str {
 }
 
 fn run() -> Result<()> {
-    scurry_ctl::capture::run(open()?)
+    use std::sync::{Arc, Mutex};
+
+    let dongle = Arc::new(Mutex::new(open()?));
+    let state = Arc::new(scurry_ctl::ipc::DaemonState::default());
+
+    // The control socket runs alongside capture so the tray can reach the
+    // dongle without opening the serial port, which the daemon holds
+    // exclusively.
+    let socket_link = Arc::clone(&dongle);
+    let socket_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        if let Err(e) = scurry_ctl::ipc::serve(socket_link, socket_state) {
+            eprintln!("control socket: {e}");
+        }
+    });
+
+    scurry_ctl::capture::run(dongle, state)
 }
 
 fn probe() -> Result<()> {

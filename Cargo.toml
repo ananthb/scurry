@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/scurry-proto", "crates/scurry-layout", "crates/scurry-ctl"]
+members = [
+  "crates/scurry-proto",
+  "crates/scurry-layout",
+  "crates/scurry-ctl",
+  "binaries/scurry-tray",
+]
 # scurry-ffi is excluded: it is a no_std staticlib for riscv32imc and must not
 # be built for the host by a bare `cargo build`.
 exclude = ["crates/scurry-ffi"]
