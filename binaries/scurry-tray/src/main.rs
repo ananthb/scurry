@@ -5,7 +5,7 @@
 //!   --settings             the settings window, launched by the tray
 //!   --print-desktop-entry  regenerate packaging/scurry-tray.desktop
 
-mod daemon;
+mod login;
 mod packaging;
 mod settings;
 mod status;

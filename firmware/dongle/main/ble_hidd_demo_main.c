@@ -89,11 +89,35 @@ static void scurry_publish_available(void)
 
 static void scurry_conn_add(uint16_t conn_id, esp_bd_addr_t bda)
 {
+    /* Prefer the node the layout pinned to this address. Slots used to be
+       handed out in connection order, so after a reboot whichever machine won
+       the race took node 1 -- silently swapping two screens, with the pointer
+       going left to the machine that should have been on the right, and no
+       error anywhere to explain it. */
+    int32_t pinned = scurry_layout_node_for_address((const uint8_t *)bda);
+    if (pinned > 0 && pinned <= SCURRY_MAX_HOSTS) {
+        int idx = (int)pinned - 1;
+        if (!scurry_conn_used[idx]) {
+            scurry_conn_used[idx] = true;
+            scurry_conns[idx] = conn_id;
+            memcpy(scurry_conn_bda[idx], bda, sizeof(esp_bd_addr_t));
+            ESP_LOGI(HID_DEMO_TAG, "scurry: %02x:%02x:%02x:%02x:%02x:%02x is node %d (pinned)",
+                     bda[0], bda[1], bda[2], bda[3], bda[4], bda[5], (int)pinned);
+            scurry_publish_available();
+            return;
+        }
+        ESP_LOGW(HID_DEMO_TAG, "scurry: node %d is pinned but already in use", (int)pinned);
+    }
+
+    /* Unpinned, or its node is taken: fall back to the first free slot so an
+       unrecognised machine still works and can be pinned afterwards. */
     for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
         if (!scurry_conn_used[i]) {
             scurry_conn_used[i] = true;
             scurry_conns[i] = conn_id;
             memcpy(scurry_conn_bda[i], bda, sizeof(esp_bd_addr_t));
+            ESP_LOGI(HID_DEMO_TAG, "scurry: %02x:%02x:%02x:%02x:%02x:%02x is node %d (unpinned)",
+                     bda[0], bda[1], bda[2], bda[3], bda[4], bda[5], i + 1);
             scurry_publish_available();
             return;
         }
@@ -302,7 +326,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
 
 #define SCURRY_MAGIC        0x53
-#define SCURRY_VERSION      2
+#define SCURRY_VERSION      3
 #define SCURRY_HEADER_LEN   8
 #define SCURRY_MAX_PAYLOAD  256
 
@@ -419,7 +443,7 @@ static esp_err_t scurry_nvs_save(const uint8_t *buf, size_t len)
     if (nvs_get_blob(h, SCURRY_NVS_KEY_LAYOUT, existing, &existing_len) == ESP_OK &&
         existing_len == len && memcmp(existing, buf, len) == 0) {
         nvs_close(h);
-        ESP_LOGI(HID_DEMO_TAG, "scurry: layout unchanged, not rewriting");
+        ESP_LOGI(HID_DEMO_TAG, "scurry: layout unchanged, not rewriting flash");
         return ESP_OK;
     }
 
@@ -579,6 +603,67 @@ static void scurry_send_status(void)
     scurry_send(SCURRY_KIND_STATUS, buf, sizeof(buf));
 }
 
+/* Re-resolve every live connection against the current layout.
+ *
+ * The pin lookup happens when a machine connects, so connections established
+ * before a layout arrived keep whatever slot they were given in the order they
+ * turned up. Editing the layout while machines are connected -- which is the
+ * normal case, since that is when you can see what needs fixing -- would
+ * otherwise leave the table disagreeing with the config it was just given, and
+ * the pointer going left to the machine that should have been on the right.
+ */
+static void scurry_reassign_nodes(void)
+{
+    uint16_t      old_conn[SCURRY_MAX_HOSTS];
+    bool          old_used[SCURRY_MAX_HOSTS];
+    esp_bd_addr_t old_bda[SCURRY_MAX_HOSTS];
+    memcpy(old_conn, scurry_conns, sizeof(old_conn));
+    memcpy(old_used, scurry_conn_used, sizeof(old_used));
+    memcpy(old_bda, scurry_conn_bda, sizeof(old_bda));
+
+    memset(scurry_conn_used, 0, sizeof(scurry_conn_used));
+    memset(scurry_conns, 0, sizeof(scurry_conns));
+    memset(scurry_conn_bda, 0, sizeof(scurry_conn_bda));
+
+    /* Pinned machines first, so an unpinned one cannot take a seat that is
+       reserved for somebody else. */
+    for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
+        if (!old_used[i]) {
+            continue;
+        }
+        int32_t node = scurry_layout_node_for_address((const uint8_t *)old_bda[i]);
+        if (node > 0 && node <= SCURRY_MAX_HOSTS && !scurry_conn_used[node - 1]) {
+            int idx = (int)node - 1;
+            scurry_conn_used[idx] = true;
+            scurry_conns[idx] = old_conn[i];
+            memcpy(scurry_conn_bda[idx], old_bda[i], sizeof(esp_bd_addr_t));
+            old_used[i] = false;
+            ESP_LOGI(HID_DEMO_TAG, "scurry: reassigned %02x:%02x:%02x:%02x:%02x:%02x to node %d",
+                     old_bda[i][0], old_bda[i][1], old_bda[i][2],
+                     old_bda[i][3], old_bda[i][4], old_bda[i][5], (int)node);
+        }
+    }
+
+    /* Then whatever is left, into whatever is free. */
+    for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
+        if (!old_used[i]) {
+            continue;
+        }
+        for (int j = 0; j < SCURRY_MAX_HOSTS; j++) {
+            if (!scurry_conn_used[j]) {
+                scurry_conn_used[j] = true;
+                scurry_conns[j] = old_conn[i];
+                memcpy(scurry_conn_bda[j], old_bda[i], sizeof(esp_bd_addr_t));
+                ESP_LOGI(HID_DEMO_TAG, "scurry: %02x:%02x:%02x:%02x:%02x:%02x is node %d (unpinned)",
+                         old_bda[i][0], old_bda[i][1], old_bda[i][2],
+                         old_bda[i][3], old_bda[i][4], old_bda[i][5], j + 1);
+                break;
+            }
+        }
+    }
+    scurry_publish_available();
+}
+
 static void scurry_handle_set_config(const uint8_t *p, uint16_t len)
 {
     /* Validate before storing. scurry_layout_load runs the same checks the
@@ -595,7 +680,9 @@ static void scurry_handle_set_config(const uint8_t *p, uint16_t len)
         scurry_send_ack(SCURRY_ACK_STORAGE_FAILED);
         return;
     }
-    ESP_LOGI(HID_DEMO_TAG, "scurry: layout stored (%u bytes)", (unsigned)len);
+    ESP_LOGI(HID_DEMO_TAG, "scurry: layout accepted (%u bytes)", (unsigned)len);
+    /* Machines already connected were seated before this layout existed. */
+    scurry_reassign_nodes();
     scurry_send_ack(SCURRY_ACK_OK);
 }
 

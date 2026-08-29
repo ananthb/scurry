@@ -14,7 +14,8 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use scurry_proto::{kind, Header, HEADER_LEN, MAGIC, MAX_PAYLOAD, VERSION};
@@ -43,11 +44,67 @@ pub fn socket_path() -> PathBuf {
     home.join(".scurry.sock")
 }
 
-/// Shared state the tray asks about.
+/// Shared state, and the rendezvous for replies from the dongle.
+///
+/// # Why replies come through here
+///
+/// Exactly one thread may read the serial port, and that is the capture reader
+/// -- it has to be, since FOCUS arrives unsolicited. A caller that wanted a
+/// reply could not simply read the port itself, and holding the link lock while
+/// waiting for one would stall pointer motion for as long as the timeout. So
+/// requests are written under a brief lock and the reader hands the answer back
+/// here.
 #[derive(Debug, Default)]
 pub struct DaemonState {
     /// Node currently holding the pointer; 0 is this machine.
     pub focus: AtomicU8,
+    /// The most recent reply that was not a FOCUS announcement.
+    reply: Mutex<Option<(u8, Vec<u8>)>>,
+    arrived: Condvar,
+}
+
+impl DaemonState {
+    /// Called by the reader thread for anything that is not FOCUS.
+    pub fn deliver(&self, kind: u8, payload: Vec<u8>) {
+        if let Ok(mut slot) = self.reply.lock() {
+            *slot = Some((kind, payload));
+            self.arrived.notify_all();
+        }
+    }
+
+    /// Send a request and wait for the reader thread to hand back the answer.
+    ///
+    /// Queries are rare and serialised by this lock, which is why one reply
+    /// slot suffices: there is never more than one in flight.
+    pub fn request(
+        &self,
+        link: &Mutex<Dongle>,
+        kind: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(u8, Vec<u8>)> {
+        let mut slot = self
+            .reply
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reply slot poisoned"))?;
+        *slot = None;
+
+        {
+            // Held only for the write, so pointer motion is never waiting on a
+            // config query.
+            let mut guard = link.lock().map_err(|_| anyhow::anyhow!("link poisoned"))?;
+            guard.send(kind, payload)?;
+        }
+
+        let (slot, timed_out) = self
+            .arrived
+            .wait_timeout_while(slot, timeout, |s| s.is_none())
+            .map_err(|_| anyhow::anyhow!("reply slot poisoned"))?;
+        if timed_out.timed_out() {
+            anyhow::bail!("the dongle did not answer a {kind:#04x} within {timeout:?}");
+        }
+        slot.clone().ok_or_else(|| anyhow::anyhow!("woken with no reply"))
+    }
 }
 
 /// Serve the control socket until the process exits.
@@ -91,28 +148,9 @@ fn handle(mut stream: UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonSta
         }
         // Anything else is for the dongle. Forward it and relay the answer.
         _ => {
-            let mut guard = dongle.lock().map_err(|_| anyhow::anyhow!("dongle lock poisoned"))?;
-            guard.send(h.kind, &payload)?;
-
-            let want = match h.kind {
-                kind::GET_CONFIG => kind::CONFIG,
-                kind::GET_STATUS => kind::STATUS,
-                kind::SET_CONFIG => kind::ACK,
-                kind::PING => kind::PONG,
-                _ => kind::ACK,
-            };
-            let mut on_log = |line: &str| eprintln!("[dongle] {line}");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while std::time::Instant::now() < deadline {
-                if let Some(msg) =
-                    guard.recv(std::time::Duration::from_millis(200), &mut on_log)?
-                {
-                    if msg.kind == want || msg.kind == kind::ACK {
-                        return reply(&mut stream, msg.kind, &msg.payload);
-                    }
-                }
-            }
-            anyhow::bail!("dongle did not answer a forwarded {:#04x}", h.kind)
+            let (k, p) = state.request(dongle, h.kind, &payload, Duration::from_secs(3))?;
+            let _ = kind::ACK;
+            reply(&mut stream, k, &p)
         }
     }
 }

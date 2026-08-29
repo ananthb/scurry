@@ -26,6 +26,32 @@ pub struct ScreenConfig {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Bluetooth address of the machine at this screen, "aa:bb:cc:dd:ee:ff".
+    ///
+    /// Optional. Without it the node is whichever machine connects into that
+    /// slot first, which reverses two screens whenever a reboot resolves the
+    /// race the other way. `scurry-ctl status` prints the addresses to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+/// Parse "aa:bb:cc:dd:ee:ff". Also accepts bare hex, since that is how the
+/// dongle's own logs print addresses.
+pub fn parse_bda(text: &str) -> Result<[u8; 6]> {
+    let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 12 {
+        bail!("{text:?} is not a Bluetooth address (need 12 hex digits, got {})", hex.len());
+    }
+    let mut out = [0u8; 6];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("parsing {text:?}"))?;
+    }
+    Ok(out)
+}
+
+pub fn format_bda(bda: [u8; 6]) -> String {
+    bda.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
 impl Config {
@@ -68,7 +94,11 @@ impl Config {
         let mut out = vec![self.screens.len() as u8];
         out.resize(1 + self.screens.len() * SCREEN_WIRE_LEN, 0);
         for (i, s) in self.screens.iter().enumerate() {
-            let w = ScreenWire::with_name(s.node, &s.name, s.x, s.y, s.width, s.height);
+            let bda = match &s.address {
+                Some(a) => parse_bda(a)?,
+                None => [0u8; 6],
+            };
+            let w = ScreenWire::pinned(s.node, &s.name, s.x, s.y, s.width, s.height, bda);
             w.encode_into(&mut out[1 + i * SCREEN_WIRE_LEN..]);
         }
         Ok(out)
@@ -97,6 +127,7 @@ impl Config {
                 y: w.y,
                 width: w.width,
                 height: w.height,
+                address: w.is_pinned().then(|| format_bda(w.bda)),
             });
         }
         Ok(Config { screens })
@@ -114,7 +145,15 @@ mod tests {
     fn sample() -> Config {
         Config {
             screens: vec![
-                ScreenConfig { name: "mac".into(), node: 0, x: 0, y: 0, width: 1512, height: 982 },
+                ScreenConfig {
+                    name: "mac".into(),
+                    node: 0,
+                    x: 0,
+                    y: 0,
+                    width: 1512,
+                    height: 982,
+                    address: None,
+                },
                 ScreenConfig {
                     name: "chromebook".into(),
                     node: 1,
@@ -122,6 +161,7 @@ mod tests {
                     y: 0,
                     width: 1920,
                     height: 1080,
+                    address: Some("f0:68:e3:e5:d1:b1".into()),
                 },
             ],
         }
@@ -154,6 +194,25 @@ mod tests {
         let mut cfg = sample();
         cfg.screens[1].height = 0;
         assert!(cfg.to_payload().is_err());
+    }
+
+    #[test]
+    fn addresses_survive_the_round_trip() {
+        let cfg = sample();
+        let back = Config::from_payload(&cfg.to_payload().unwrap()).unwrap();
+        assert_eq!(back.screens[1].address.as_deref(), Some("f0:68:e3:e5:d1:b1"));
+        // An unpinned screen must come back unpinned, not as all-zeroes text.
+        assert_eq!(back.screens[0].address, None);
+    }
+
+    #[test]
+    fn address_parsing_accepts_both_spellings() {
+        let want = [0xf0, 0x68, 0xe3, 0xe5, 0xd1, 0xb1];
+        assert_eq!(parse_bda("f0:68:e3:e5:d1:b1").unwrap(), want);
+        // The dongle's own logs print addresses unseparated.
+        assert_eq!(parse_bda("f068e3e5d1b1").unwrap(), want);
+        assert!(parse_bda("f0:68:e3").is_err());
+        assert!(parse_bda("zz:68:e3:e5:d1:b1").is_err());
     }
 
     #[test]

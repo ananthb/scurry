@@ -95,6 +95,7 @@ impl eframe::App for SettingsApp {
                         y: 0,
                         width: 1920,
                         height: 1080,
+                        address: None,
                     });
                 }
             });
@@ -128,6 +129,28 @@ impl eframe::App for SettingsApp {
                                 remove = Some(i);
                             }
                         });
+                        if screen.node != 0 {
+                            ui.horizontal(|ui| {
+                                ui.label("Address");
+                                let mut text = screen.address.clone().unwrap_or_default();
+                                let changed = ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut text)
+                                            .desired_width(180.0)
+                                            .hint_text("aa:bb:cc:dd:ee:ff"),
+                                    )
+                                    .changed();
+                                if changed {
+                                    // Empty means unpinned: whichever machine
+                                    // connects into this slot first.
+                                    screen.address =
+                                        (!text.trim().is_empty()).then(|| text.trim().to_string());
+                                }
+                                if screen.address.is_none() {
+                                    ui.label("unpinned — first to connect");
+                                }
+                            });
+                        }
                         ui.horizontal(|ui| {
                             ui.label("Position");
                             ui.add(egui::DragValue::new(&mut screen.x).prefix("x "));

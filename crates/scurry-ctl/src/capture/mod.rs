@@ -4,7 +4,7 @@
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::run;
+pub use macos::{accessibility_trusted, install, run, CaptureHandle};
 
 #[cfg(not(target_os = "macos"))]
 pub fn run(

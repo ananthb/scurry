@@ -22,6 +22,10 @@ height = 1964
 [[screen]]
 name = "linux"
 node = 1
+# Pin the node to a machine's Bluetooth address, from `scurry-ctl status`.
+# Without it the node is whichever machine connects into that slot first, so a
+# dongle reboot can silently swap two screens.
+address = "f0:68:e3:e5:d1:b1"
 x = 3024
 y = 262
 width = 2560

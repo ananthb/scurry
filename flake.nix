@@ -134,7 +134,6 @@
               patchelf --remove-rpath scurry/scurry-tray
 
               cp ${./packaging/scurry-tray.desktop} scurry/scurry-tray.desktop
-              cp ${./packaging/scurry.service} scurry/scurry.service
               cp ${./packaging/99-scurry-dongle.rules} scurry/99-scurry-dongle.rules
               cp ${./scurry.toml.example} scurry/scurry.toml.example
               cp ${./assets/icon-256.png} scurry/scurry.png
@@ -192,30 +191,10 @@
               # Destinations are named explicitly: `cp \''${./x} dir/` keeps the
               # store hash in the filename, and Install Daemon.command looks the
               # plist up by name.
-              cp ${./packaging/com.ananthb.scurry.plist} staging/com.ananthb.scurry.plist
-              cp ${./scurry.toml.example} staging/scurry.toml.example
-
-              cat > "staging/Install Daemon.command" <<'SCRIPT'
-              #!/bin/bash
-              # Installs the LaunchAgent so the daemon starts at login.
-              set -e
-              app="/Applications/scurry.app"
-              if [ ! -d "$app" ]; then
-                echo "Drag scurry.app to Applications first, then run this again."
-                exit 1
-              fi
-              plist="$HOME/Library/LaunchAgents/com.ananthb.scurry.plist"
-              mkdir -p "$HOME/Library/LaunchAgents"
-              sed "s|HOME_DIR|$HOME|g" "$(dirname "$0")/com.ananthb.scurry.plist" > "$plist"
-              launchctl bootout "gui/$(id -u)/com.ananthb.scurry" 2>/dev/null || true
-              launchctl bootstrap "gui/$(id -u)" "$plist"
-              echo "Installed and started. Logs: ~/Library/Logs/scurry.log"
-              echo
-              echo "scurry needs Accessibility permission to capture the pointer:"
-              echo "System Settings > Privacy & Security > Accessibility > add scurry."
-              SCRIPT
-              chmod +x "staging/Install Daemon.command"
-
+              # Nothing else ships. The app registers its own login item from the
+              # menu and prompts for Accessibility with the system's own dialog,
+              # so there is no installer script and nothing for the user to read:
+              # drag it across and open it.
               ln -s /Applications staging/Applications
 
               # `hdiutil create -srcfolder` intermittently fails with "Resource

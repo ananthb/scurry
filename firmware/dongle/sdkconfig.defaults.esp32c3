@@ -20,3 +20,9 @@ CONFIG_BT_BLE_SMP_ENABLE=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# No TLS anywhere in this firmware, so the bundled CA certificate list is dead
+# weight -- and generating it needs a python cryptography module that is broken
+# in the pinned toolchain (ImportError: _PyIter_NextItem). Turning it off both
+# fixes the build and drops a few KB we were never going to use.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n

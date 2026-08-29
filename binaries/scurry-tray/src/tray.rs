@@ -1,43 +1,41 @@
-//! The tray icon and its menu.
+//! The tray icon, and the app itself.
 //!
-//! # Why the settings pane is a separate process
+//! This process *is* scurry: it owns the dongle's serial port, captures input,
+//! and shows the menu. There is no daemon to install and no service manager
+//! involved, because winit's event loop is a CFRunLoop and the input tap can be
+//! installed straight into it. Dragging the app to Applications is the whole
+//! installation.
 //!
-//! winit permits exactly one event loop per process, and the tray already owns
-//! one. Rather than thread an egui window through the tray's loop -- which ties
-//! the two together and makes a settings crash take the tray with it -- the
-//! menu re-executes this binary with `--settings`.
+//! It also serves the control socket, so the settings window -- a separate
+//! process, since winit permits one event loop per process -- can reach the
+//! dongle without opening the port a second time.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use scurry_ctl::ipc::DaemonState;
+use scurry_ctl::transport::Dongle;
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
-use crate::daemon;
-use crate::status::Status;
+use crate::login;
+use crate::status::{spawn_poller, Snapshot};
 
-/// How often the menu is rebuilt from the daemon.
-///
-/// The tray has no push channel -- the daemon's socket is request/response --
-/// so this is a poll. Two seconds is well under the time it takes to notice a
-/// stale menu, and the query is a few bytes over a Unix socket.
+/// How often the menu is rebuilt, and how often a missing dongle is retried.
 const REFRESH: Duration = Duration::from_secs(2);
 
 const ID_SETTINGS: &str = "settings";
-const ID_START: &str = "start";
-const ID_STOP: &str = "stop";
-const ID_RESTART: &str = "restart";
+const ID_LOGIN: &str = "login";
 const ID_QUIT: &str = "quit";
 
-/// Decode the embedded PNG into the RGBA the tray wants.
 fn icon() -> Result<tray_icon::Icon> {
     const PNG: &[u8] = include_bytes!("../../../assets/tray.png");
-    let decoder = png::Decoder::new(PNG);
-    let mut reader = decoder.read_info()?;
+    let mut reader = png::Decoder::new(PNG).read_info()?;
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf)?;
     buf.truncate(info.buffer_size());
@@ -45,121 +43,159 @@ fn icon() -> Result<tray_icon::Icon> {
         .map_err(|e| anyhow!("building tray icon: {e}"))
 }
 
-fn build_menu(status: &Status) -> Menu {
-    let menu = Menu::new();
-
-    if !status.daemon_running {
-        // Not installed and not started are different problems with different
-        // fixes. Saying "not running" for both sends the user looking in the
-        // wrong place.
-        if status.daemon_installed {
-            let _ = menu.append(&MenuItem::new("scurry is not running", false, None));
-        } else {
-            let _ = menu.append(&MenuItem::new("scurry is not installed", false, None));
-            let _ = menu.append(&MenuItem::new(daemon::install_hint(), false, None));
-        }
-    } else {
-        let where_ = if status.focus == 0 {
-            "this machine".to_string()
-        } else {
-            status.screen_name(status.focus)
-        };
-        let _ = menu.append(&MenuItem::new(format!("Pointer on {where_}"), false, None));
-
-        let connected = status.slots.iter().filter(|s| s.connected).count();
-        let _ = menu.append(&MenuItem::new(
-            match connected {
-                0 => "No machines connected".to_string(),
-                1 => "1 machine connected".to_string(),
-                n => format!("{n} machines connected"),
-            },
-            false,
-            None,
-        ));
-
-        if !status.screens.is_empty() {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-            for screen in &status.screens {
-                // Node 0 is this machine; it has no connection slot.
-                let mark = if screen.node == 0 {
-                    "  (this machine)"
-                } else if status
-                    .slots
-                    .iter()
-                    .any(|s| s.slot + 1 == screen.node && s.connected)
-                {
-                    "  connected"
-                } else {
-                    "  offline"
-                };
-                let _ = menu.append(&MenuItem::new(
-                    format!("{} — {}x{}{}", screen.name, screen.width, screen.height, mark),
-                    false,
-                    None,
-                ));
-            }
-        }
-    }
-
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(
-        MenuId::new(ID_SETTINGS),
-        "Settings…",
-        status.daemon_running,
-        None,
-    ));
-
-    if daemon::SUPPORTED {
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        // Disabled until the installer has run: pressing it would only report
-        // a missing unit, which the menu already says above.
-        let _ = menu.append(&MenuItem::with_id(
-            MenuId::new(ID_START),
-            "Start",
-            status.daemon_installed && !status.daemon_running,
-            None,
-        ));
-        let _ = menu.append(&MenuItem::with_id(
-            MenuId::new(ID_STOP),
-            "Stop",
-            status.daemon_running,
-            None,
-        ));
-        let _ = menu.append(&MenuItem::with_id(
-            MenuId::new(ID_RESTART),
-            "Restart",
-            status.daemon_running,
-            None,
-        ));
-    }
-
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(MenuId::new(ID_QUIT), "Quit", true, None));
-    menu
-}
-
 struct App {
     tray: Option<TrayIcon>,
+    /// The dongle link, once one has been found. Absent means unplugged, which
+    /// is an ordinary state rather than an error: the app waits for it.
+    link: Option<Arc<Mutex<Dongle>>>,
+    state: Arc<DaemonState>,
+    /// Kept alive because dropping the tap stops input capture.
+    #[cfg(target_os = "macos")]
+    _tap: Option<scurry_ctl::capture::CaptureHandle>,
+    socket_started: bool,
+    /// Most recent answer from the dongle. Written by a background poller so
+    /// the menu never blocks on serial I/O.
+    snapshot: Arc<Mutex<Snapshot>>,
     next_refresh: Instant,
 }
 
 impl App {
+    fn new() -> Self {
+        Self {
+            tray: None,
+            link: None,
+            state: Arc::new(DaemonState::default()),
+            #[cfg(target_os = "macos")]
+            _tap: None,
+            socket_started: false,
+            snapshot: Arc::new(Mutex::new(Snapshot::NoDongle)),
+            next_refresh: Instant::now(),
+        }
+    }
+
+    /// Try to attach to a dongle, and start capture once one is there.
+    fn try_attach(&mut self) {
+        if self.link.is_some() {
+            return;
+        }
+        let Ok(path) = Dongle::autodetect() else { return };
+        let Ok(dongle) = Dongle::open(&path) else { return };
+        eprintln!("dongle: {path}");
+        let link = Arc::new(Mutex::new(dongle));
+
+        #[cfg(target_os = "macos")]
+        {
+            match scurry_ctl::capture::install(Arc::clone(&link), Arc::clone(&self.state)) {
+                Ok(tap) => self._tap = Some(tap),
+                Err(e) => {
+                    eprintln!("could not start capture: {e}");
+                    return;
+                }
+            }
+        }
+
+        // The settings window is a separate process and cannot open the port,
+        // which this one holds. Serve it here instead.
+        if !self.socket_started {
+            let socket_link = Arc::clone(&link);
+            let socket_state = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                if let Err(e) = scurry_ctl::ipc::serve(socket_link, socket_state) {
+                    eprintln!("control socket: {e}");
+                }
+            });
+            self.socket_started = true;
+        }
+
+        spawn_poller(Arc::clone(&link), Arc::clone(&self.state), Arc::clone(&self.snapshot));
+        self.link = Some(link);
+    }
+
+    fn build_menu(&self, snap: &Snapshot) -> Menu {
+        let menu = Menu::new();
+
+        match snap {
+            Snapshot::NoDongle => {
+                let _ = menu.append(&MenuItem::new("No dongle connected", false, None));
+            }
+            #[cfg(target_os = "macos")]
+            Snapshot::NeedsPermission => {
+                let _ = menu.append(&MenuItem::new("Waiting for Accessibility access", false, None));
+            }
+            Snapshot::Ready { focus, screens, slots } => {
+                let here = *focus == 0;
+                let name = screens
+                    .iter()
+                    .find(|s| s.node == *focus)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| format!("node {focus}"));
+                let _ = menu.append(&MenuItem::new(
+                    if here { "Pointer here".to_string() } else { format!("Pointer on {name}") },
+                    false,
+                    None,
+                ));
+
+                if !screens.is_empty() {
+                    let _ = menu.append(&PredefinedMenuItem::separator());
+                    for screen in screens {
+                        let mark = if screen.node == 0 {
+                            "this machine"
+                        } else if slots.iter().any(|s| s.slot + 1 == screen.node && s.connected) {
+                            "connected"
+                        } else {
+                            "offline"
+                        };
+                        let _ = menu.append(&MenuItem::new(
+                            format!("{}  ·  {}×{}  ·  {mark}", screen.name, screen.width, screen.height),
+                            false,
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&MenuItem::with_id(
+            MenuId::new(ID_SETTINGS),
+            "Settings…",
+            matches!(snap, Snapshot::Ready { .. }),
+            None,
+        ));
+        let _ = menu.append(&CheckMenuItem::with_id(
+            MenuId::new(ID_LOGIN),
+            "Open at Login",
+            true,
+            login::enabled(),
+            None,
+        ));
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&MenuItem::with_id(MenuId::new(ID_QUIT), "Quit scurry", true, None));
+        menu
+    }
+
     fn refresh(&mut self) {
-        let status = Status::fetch();
-        let menu = build_menu(&status);
+        self.try_attach();
+
+        let snap = if self.link.is_none() {
+            Snapshot::NoDongle
+        } else {
+            #[cfg(target_os = "macos")]
+            if !scurry_ctl::capture::accessibility_trusted(false) {
+                Snapshot::NeedsPermission
+            } else {
+                self.snapshot.lock().map(|s| s.clone()).unwrap_or(Snapshot::NoDongle)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.snapshot.lock().map(|s| s.clone()).unwrap_or(Snapshot::NoDongle)
+            }
+        };
+
+        let menu = self.build_menu(&snap);
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu)));
-            let _ = tray.set_tooltip(Some(if !status.daemon_installed {
-                "scurry — not installed".to_string()
-            } else if status.daemon_running {
-                format!("scurry — pointer on {}", if status.focus == 0 {
-                    "this machine".to_string()
-                } else {
-                    status.screen_name(status.focus)
-                })
-            } else {
-                "scurry — not running".to_string()
-            }));
+            let _ = tray.set_tooltip(Some(snap.tooltip()));
         }
         self.next_refresh = Instant::now() + REFRESH;
     }
@@ -167,26 +203,28 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
-        // The tray must be created after the event loop is running: on macOS
-        // NSStatusItem needs an initialised NSApplication, and building it
-        // earlier yields an icon that never appears.
-        if self.tray.is_none() {
-            let status = Status::fetch();
-            match icon() {
-                Ok(ic) => {
-                    match TrayIconBuilder::new()
-                        .with_menu(Box::new(build_menu(&status)))
-                        .with_tooltip("scurry")
-                        .with_icon(ic)
-                        .build()
-                    {
-                        Ok(t) => self.tray = Some(t),
-                        Err(e) => eprintln!("could not create tray icon: {e}"),
-                    }
-                }
-                Err(e) => eprintln!("could not load tray icon: {e}"),
-            }
+        if self.tray.is_some() {
+            return;
         }
+        // Ask for Accessibility with the system's own dialog, which offers to
+        // open the right settings pane. Printing instructions instead would put
+        // the burden on the user to find a switch they have never seen.
+        #[cfg(target_os = "macos")]
+        if !scurry_ctl::capture::accessibility_trusted(true) {
+            eprintln!("waiting for Accessibility access");
+        }
+
+        // The tray must be built after the loop is running: on macOS
+        // NSStatusItem needs an initialised NSApplication, and an icon created
+        // earlier never appears.
+        match icon() {
+            Ok(ic) => match TrayIconBuilder::new().with_tooltip("scurry").with_icon(ic).build() {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => eprintln!("could not create tray icon: {e}"),
+            },
+            Err(e) => eprintln!("could not load tray icon: {e}"),
+        }
+        self.refresh();
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
@@ -195,17 +233,17 @@ impl ApplicationHandler for App {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             match event.id.as_ref() {
                 ID_SETTINGS => spawn_settings(),
-                ID_START => report("start", daemon::start()),
-                ID_STOP => report("stop", daemon::stop()),
-                ID_RESTART => report("restart", daemon::restart()),
+                ID_LOGIN => {
+                    if let Err(e) = login::toggle() {
+                        eprintln!("could not change the login item: {e}");
+                    }
+                }
                 ID_QUIT => {
                     event_loop.exit();
                     return;
                 }
                 _ => {}
             }
-            // Service actions change what the menu should say; do not wait for
-            // the next poll to reflect it.
             self.refresh();
         }
 
@@ -216,21 +254,12 @@ impl ApplicationHandler for App {
     }
 }
 
-fn report(action: &str, result: Result<()>) {
-    if let Err(e) = result {
-        eprintln!("could not {action} the daemon: {e}");
-    }
-}
-
-/// Re-exec ourselves for the settings window. See the module docs for why this
-/// is a process rather than a window in this one.
+/// The settings window runs as its own process: winit permits one event loop
+/// per process and this one is the tray's.
 fn spawn_settings() {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("cannot locate own binary to open settings: {e}");
-            return;
-        }
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("cannot locate own binary to open settings");
+        return;
     };
     if let Err(e) = std::process::Command::new(exe).arg("--settings").spawn() {
         eprintln!("could not open settings: {e}");
@@ -240,7 +269,6 @@ fn spawn_settings() {
 pub fn run() -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { tray: None, next_refresh: Instant::now() };
-    event_loop.run_app(&mut app)?;
+    event_loop.run_app(&mut App::new())?;
     Ok(())
 }

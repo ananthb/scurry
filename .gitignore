@@ -1,5 +1,6 @@
-/target
-/firmware/target
+# Unanchored so it matches nested crates too: crates/scurry-ffi builds its own
+# target/ as a separate workspace, and an anchored /target missed it entirely.
+target/
 result
 result-*
 .direnv

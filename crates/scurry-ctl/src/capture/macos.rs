@@ -188,12 +188,36 @@ fn clamp_i16(v: i64) -> i16 {
 /// callback does not need the connection lock just to update a bitmask.
 static BUTTONS: AtomicU8 = AtomicU8::new(0);
 
-/// Capture local input and forward it to the dongle, forever.
+/// Opaque handle keeping capture alive. Dropping it stops input capture.
 ///
-/// The link is shared with the control socket, which is why it arrives behind a
-/// mutex: the daemon owns the serial port exclusively, so the tray reaches the
-/// dongle by asking the daemon rather than opening the port itself.
+/// Aliased so callers do not need core-graphics in their own dependency list
+/// just to name the thing they are holding.
+pub type CaptureHandle = CGEventTap<'static>;
+
+/// Install capture into the *current* run loop and return without blocking.
+///
+/// winit's event loop is a CFRunLoop, so the tray can host the event tap
+/// directly instead of needing a separate process for it. That is what lets the
+/// whole app be one binary the user drags to Applications: no daemon to
+/// install, no service manager, no port contention, because there is only one
+/// process and it owns the port.
+///
+/// The returned tap must be kept alive; dropping it stops capture.
+pub fn install(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<CaptureHandle> {
+    build(dongle, state)
+}
+
+/// Capture local input and forward it to the dongle, blocking forever.
+///
+/// For headless use, where there is no other run loop to join.
 pub fn run(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> {
+    let _tap = build(dongle, state)?;
+    eprintln!("capturing; move the pointer off a screen edge to hand over");
+    unsafe { CFRunLoop::run_current() };
+    Ok(())
+}
+
+fn build(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<CaptureHandle> {
     install_cleanup();
 
     // The dongle owns the layout, so it must tell us where the pointer went;
@@ -217,7 +241,10 @@ pub fn run(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> {
                         eprintln!("focus -> node {node}");
                     }
                 }
-                Ok(_) => {}
+                // Anything that is not a focus announcement is somebody's
+                // reply; hand it to whoever is waiting.
+                Ok(Some(msg)) => focus_state.deliver(msg.kind, msg.payload),
+                Ok(None) => {}
                 Err(e) => {
                     eprintln!("dongle read error: {e}");
                     return;
@@ -351,8 +378,28 @@ pub fn run(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> {
             .map_err(|_| anyhow!("creating run loop source for the event tap"))?;
         CFRunLoop::get_current().add_source(&source, kCFRunLoopCommonModes);
         tap.enable();
-        eprintln!("capturing; move the pointer off a screen edge to hand over");
-        CFRunLoop::run_current();
     }
-    Ok(())
+    Ok(tap)
+}
+
+/// Whether macOS has granted this process Accessibility rights.
+///
+/// `prompt` shows the system's own dialog, which offers to open the right pane
+/// of System Settings. Far better than printing instructions and hoping: the
+/// OS asks in its own words, and the user is one click from the switch.
+pub fn accessibility_trusted(prompt: bool) -> bool {
+    use core_foundation::base::{CFTypeRef, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: CFTypeRef) -> bool;
+        static kAXTrustedCheckOptionPrompt: core_foundation::string::CFStringRef;
+    }
+    unsafe {
+        let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+        let value = core_foundation::boolean::CFBoolean::from(prompt);
+        let opts = CFDictionary::from_CFType_pairs(&[(key, value)]);
+        AXIsProcessTrustedWithOptions(opts.as_CFTypeRef())
+    }
 }

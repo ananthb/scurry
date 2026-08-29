@@ -52,6 +52,14 @@ fn normalise(offset: i32, span: i32) -> u16 {
 static mut LAYOUT: Option<Layout> = None;
 static CONFIGURED: AtomicBool = AtomicBool::new(false);
 
+/// Which node each Bluetooth address belongs to, from the stored layout.
+///
+/// Kept beside the layout rather than inside it: the layout is about geometry,
+/// and which physical machine sits at a screen is a separate question it does
+/// not need to answer.
+static mut PINS: [([u8; 6], u8); MAX_SCREENS] = [([0u8; 6], 0); MAX_SCREENS];
+static mut PIN_COUNT: usize = 0;
+
 fn edge_to_wire(e: scurry_proto::Edge) -> u8 {
     match e {
         scurry_proto::Edge::Left => 0,
@@ -84,6 +92,7 @@ pub unsafe extern "C" fn scurry_layout_load(data: *const u8, len: usize) -> i32 
     }
 
     let mut screens = [Screen::new(0, "", 0, 0, 1, 1); MAX_SCREENS];
+    let mut pins = 0usize;
     for i in 0..count {
         let off = 1 + i * SCREEN_WIRE_LEN;
         let w = match ScreenWire::decode(&buf[off..]) {
@@ -94,7 +103,12 @@ pub unsafe extern "C" fn scurry_layout_load(data: *const u8, len: usize) -> i32 
             return -5;
         }
         screens[i] = Screen::new(w.node, w.name_str(), w.x, w.y, w.width, w.height);
+        if w.is_pinned() {
+            PINS[pins] = (w.bda, w.node);
+            pins += 1;
+        }
     }
+    PIN_COUNT = pins;
 
     match Layout::new(&screens[..count]) {
         Ok(l) => {
@@ -129,10 +143,42 @@ pub unsafe extern "C" fn scurry_layout_save(out: *mut u8, cap: usize) -> i32 {
     let buf = core::slice::from_raw_parts_mut(out, cap);
     buf[0] = screens.len() as u8;
     for (i, s) in screens.iter().enumerate() {
-        let w = ScreenWire::with_name(s.node, s.name(), s.x, s.y, s.width, s.height);
+        // Carry the pin back out, or a read-modify-write through the settings
+        // pane would silently unpin every screen.
+        let mut bda = [0u8; 6];
+        let pins = &*core::ptr::addr_of!(PINS);
+        for (pinned, node) in pins.iter().take(PIN_COUNT) {
+            if *node == s.node {
+                bda = *pinned;
+            }
+        }
+        let w = ScreenWire::pinned(s.node, s.name(), s.x, s.y, s.width, s.height, bda);
         w.encode_into(&mut buf[1 + i * SCREEN_WIRE_LEN..]);
     }
     need as i32
+}
+
+/// The node pinned to this Bluetooth address, or -1 if none is.
+///
+/// Lets the dongle give a reconnecting machine the same node id every time,
+/// instead of whichever slot happened to be free. Without it, two screens
+/// silently swap whenever the connection race resolves the other way.
+///
+/// # Safety
+/// `bda` must point to six readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn scurry_layout_node_for_address(bda: *const u8) -> i32 {
+    if bda.is_null() {
+        return -1;
+    }
+    let addr = core::slice::from_raw_parts(bda, 6);
+    let pins = &*core::ptr::addr_of!(PINS);
+    for (pinned, node) in pins.iter().take(PIN_COUNT) {
+        if pinned == addr {
+            return *node as i32;
+        }
+    }
+    -1
 }
 
 /// Declare which nodes can currently receive input, as a bitmask where bit N

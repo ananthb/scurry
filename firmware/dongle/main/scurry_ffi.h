@@ -37,6 +37,11 @@ int32_t scurry_layout_load(const uint8_t *data, size_t len);
    Returns bytes written, or negative on error. */
 int32_t scurry_layout_save(uint8_t *out, size_t cap);
 
+/* The node pinned to this Bluetooth address, or -1 if none is. Lets a
+   reconnecting machine keep the same node id instead of taking whichever slot
+   was free, which silently swapped screens across a reboot. */
+int32_t scurry_layout_node_for_address(const uint8_t *bda);
+
 /* Declare which nodes can receive input, as a bitmask where bit N means node N.
    Node 0 is always available. Without this the pointer crosses onto machines
    that are not connected, which looks like it sticking to an edge and dying. */

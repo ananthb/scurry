@@ -1,24 +1,17 @@
-//! What the tray knows about the daemon and the dongle.
+//! What the menu shows, and how the settings process asks for the same thing.
+//!
+//! The tray owns the dongle, so it queries directly. The settings window is a
+//! separate process and goes through the control socket instead.
+
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use scurry_ctl::config::Config;
-use scurry_ctl::ipc::{local, Client};
+use scurry_ctl::ipc::{Client, DaemonState};
+use scurry_ctl::transport::Dongle;
 use scurry_proto::{kind, SlotStatus};
-
-#[derive(Debug, Default, Clone)]
-pub struct Status {
-    /// False when the daemon is not running, which is the common case and not
-    /// an error worth shouting about.
-    pub daemon_running: bool,
-    /// False when no service unit exists yet, which is a different problem
-    /// with a different fix: the daemon cannot be started until the installer
-    /// has run.
-    pub daemon_installed: bool,
-    /// Node currently holding the pointer; 0 is this machine.
-    pub focus: u8,
-    pub slots: Vec<SlotStatus>,
-    pub screens: Vec<ScreenInfo>,
-}
 
 #[derive(Debug, Clone)]
 pub struct ScreenInfo {
@@ -28,65 +21,95 @@ pub struct ScreenInfo {
     pub height: i32,
 }
 
-impl Status {
-    /// Ask the daemon for everything the menu needs.
-    ///
-    /// A daemon that is not running is reported as such rather than as a
-    /// failure: the tray is expected to sit there quietly until one starts.
-    pub fn fetch() -> Self {
-        let mut s = Status::default();
-        s.daemon_installed = crate::daemon::installed();
-        let Ok(mut c) = Client::connect() else {
-            return s;
-        };
-        s.daemon_running = true;
+/// The three states worth distinguishing in the menu.
+#[derive(Debug, Clone)]
+pub enum Snapshot {
+    /// Nothing plugged in. An ordinary state, not a failure.
+    NoDongle,
+    #[cfg(target_os = "macos")]
+    /// The dongle is there but macOS has not granted Accessibility, so input
+    /// cannot be captured yet.
+    NeedsPermission,
+    Ready {
+        focus: u8,
+        screens: Vec<ScreenInfo>,
+        slots: Vec<SlotStatus>,
+    },
+}
 
-        if let Ok((k, p)) = c.request(local::GET_DAEMON_STATUS, &[]) {
-            if k == local::DAEMON_STATUS {
-                s.focus = p.first().copied().unwrap_or(0);
-            }
-        }
-        if let Ok((k, p)) = c.request(kind::GET_STATUS, &[]) {
-            if k == kind::STATUS && !p.is_empty() {
-                let count = p[0] as usize;
-                for i in 0..count {
-                    let off = 1 + i * SlotStatus::WIRE_LEN;
-                    if let Some(slot) = p.get(off..).and_then(SlotStatus::decode) {
-                        s.slots.push(slot);
-                    }
+impl Snapshot {
+    pub fn tooltip(&self) -> String {
+        match self {
+            Snapshot::NoDongle => "scurry — no dongle".into(),
+            #[cfg(target_os = "macos")]
+            Snapshot::NeedsPermission => "scurry — needs Accessibility access".into(),
+            Snapshot::Ready { focus, screens, .. } => {
+                if *focus == 0 {
+                    "scurry — pointer here".into()
+                } else {
+                    let name = screens
+                        .iter()
+                        .find(|s| s.node == *focus)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("another machine");
+                    format!("scurry — pointer on {name}")
                 }
             }
         }
-        if let Ok((k, p)) = c.request(kind::GET_CONFIG, &[]) {
+    }
+}
+
+/// Poll the dongle in the background and publish the result.
+///
+/// The menu is rebuilt on the UI thread, and a dongle query can take up to a
+/// few seconds. Doing it inline would freeze the menu for that long, so the UI
+/// only ever reads the most recent cached answer.
+pub fn spawn_poller(
+    link: Arc<Mutex<Dongle>>,
+    state: Arc<DaemonState>,
+    out: Arc<Mutex<Snapshot>>,
+) {
+    std::thread::spawn(move || loop {
+        let focus = state.focus.load(Ordering::Relaxed);
+        let mut screens = Vec::new();
+        let mut slots = Vec::new();
+
+        if let Ok((k, p)) = state.request(&link, kind::GET_CONFIG, &[], Duration::from_secs(2)) {
             if k == kind::CONFIG {
                 if let Ok(cfg) = Config::from_payload(&p) {
-                    s.screens = cfg
+                    screens = cfg
                         .screens
                         .into_iter()
-                        .map(|sc| ScreenInfo {
-                            name: sc.name,
-                            node: sc.node,
-                            width: sc.width,
-                            height: sc.height,
+                        .map(|s| ScreenInfo {
+                            name: s.name,
+                            node: s.node,
+                            width: s.width,
+                            height: s.height,
                         })
                         .collect();
                 }
             }
         }
-        s
-    }
+        if let Ok((k, p)) = state.request(&link, kind::GET_STATUS, &[], Duration::from_secs(2)) {
+            if k == kind::STATUS && !p.is_empty() {
+                let count = p[0] as usize;
+                for i in 0..count {
+                    let off = 1 + i * SlotStatus::WIRE_LEN;
+                    if let Some(slot) = p.get(off..).and_then(SlotStatus::decode) {
+                        slots.push(slot);
+                    }
+                }
+            }
+        }
 
-    /// Name for a node id, falling back to the id when the layout has no entry.
-    pub fn screen_name(&self, node: u8) -> String {
-        self.screens
-            .iter()
-            .find(|s| s.node == node)
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| format!("node {node}"))
-    }
+        if let Ok(mut cell) = out.lock() {
+            *cell = Snapshot::Ready { focus, screens, slots };
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
 }
 
-/// Read the layout as a `Config`, for the settings pane.
+/// Read the layout through the control socket, for the settings process.
 pub fn load_config() -> Result<Config> {
     let mut c = Client::connect()?;
     let (k, p) = c.request(kind::GET_CONFIG, &[])?;
@@ -96,7 +119,7 @@ pub fn load_config() -> Result<Config> {
     Config::from_payload(&p)
 }
 
-/// Push a layout back to the dongle through the daemon.
+/// Push a layout back through the control socket.
 pub fn save_config(cfg: &Config) -> Result<()> {
     let payload = cfg.to_payload()?;
     let mut c = Client::connect()?;

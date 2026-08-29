@@ -36,7 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub const MAGIC: u8 = 0x53;
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Bytes before the payload.
 pub const HEADER_LEN: usize = 8;
@@ -51,8 +51,8 @@ pub const MAX_SCREENS: usize = 5;
 /// Screen names are fixed-width so neither side needs an allocator.
 pub const NAME_LEN: usize = 16;
 
-/// Bytes one screen occupies on the wire.
-pub const SCREEN_WIRE_LEN: usize = 1 + NAME_LEN + 16;
+/// Bytes one screen occupies on the wire: node, name, geometry, peer address.
+pub const SCREEN_WIRE_LEN: usize = 1 + NAME_LEN + 16 + 6;
 
 pub mod button {
     pub const LEFT: u8 = 1 << 0;
@@ -166,6 +166,15 @@ pub struct ScreenWire {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Bluetooth address of the machine this screen belongs to; all zero when
+    /// unpinned.
+    ///
+    /// Node ids used to be connection slots, filled in whatever order machines
+    /// happened to connect. After a dongle reboot the race could reverse two
+    /// screens with no error anywhere -- push left and land on the machine that
+    /// should have been on the right. Pinning to the peer address makes the
+    /// layout mean the same thing every time.
+    pub bda: [u8; 6],
 }
 
 impl ScreenWire {
@@ -177,6 +186,7 @@ impl ScreenWire {
         out[base + 4..base + 8].copy_from_slice(&self.y.to_le_bytes());
         out[base + 8..base + 12].copy_from_slice(&self.width.to_le_bytes());
         out[base + 12..base + 16].copy_from_slice(&self.height.to_le_bytes());
+        out[base + 16..base + 22].copy_from_slice(&self.bda);
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
@@ -187,6 +197,8 @@ impl ScreenWire {
         name.copy_from_slice(&b[1..1 + NAME_LEN]);
         let base = 1 + NAME_LEN;
         let rd = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut bda = [0u8; 6];
+        bda.copy_from_slice(&b[base + 16..base + 22]);
         Some(Self {
             node: b[0],
             name,
@@ -194,6 +206,7 @@ impl ScreenWire {
             y: rd(base + 4),
             width: rd(base + 8),
             height: rd(base + 12),
+            bda,
         })
     }
 
@@ -203,11 +216,30 @@ impl ScreenWire {
     }
 
     pub fn with_name(node: u8, name: &str, x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self::pinned(node, name, x, y, width, height, [0u8; 6])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn pinned(
+        node: u8,
+        name: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        bda: [u8; 6],
+    ) -> Self {
         let mut buf = [0u8; NAME_LEN];
         let src = name.as_bytes();
         let n = core::cmp::min(src.len(), NAME_LEN);
         buf[..n].copy_from_slice(&src[..n]);
-        Self { node, name: buf, x, y, width, height }
+        Self { node, name: buf, x, y, width, height, bda }
+    }
+
+    /// True when this screen names a specific machine rather than whichever
+    /// one happens to connect first.
+    pub fn is_pinned(&self) -> bool {
+        self.bda != [0u8; 6]
     }
 }
 
@@ -368,6 +400,26 @@ mod tests {
             pan: -1,
         };
         assert_eq!(MouseState::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn pinned_screen_roundtrips() {
+        let s = ScreenWire::pinned(2, "chromebook", 1512, 131, 1280, 720,
+                                   [0xf0, 0x68, 0xe3, 0xe5, 0xd1, 0xb1]);
+        let mut buf = [0u8; SCREEN_WIRE_LEN];
+        s.encode_into(&mut buf);
+        let got = ScreenWire::decode(&buf).unwrap();
+        assert_eq!(got, s);
+        assert!(got.is_pinned());
+        assert_eq!(got.bda, [0xf0, 0x68, 0xe3, 0xe5, 0xd1, 0xb1]);
+    }
+
+    #[test]
+    fn unpinned_screen_is_recognisable() {
+        // An all-zero address means "whichever machine turns up", which is the
+        // old behaviour and still valid for a layout the user has not pinned.
+        let s = ScreenWire::with_name(1, "any", 0, 0, 100, 100);
+        assert!(!s.is_pinned());
     }
 
     #[test]
