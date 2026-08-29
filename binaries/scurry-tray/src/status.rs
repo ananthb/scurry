@@ -10,6 +10,10 @@ pub struct Status {
     /// False when the daemon is not running, which is the common case and not
     /// an error worth shouting about.
     pub daemon_running: bool,
+    /// False when no service unit exists yet, which is a different problem
+    /// with a different fix: the daemon cannot be started until the installer
+    /// has run.
+    pub daemon_installed: bool,
     /// Node currently holding the pointer; 0 is this machine.
     pub focus: u8,
     pub slots: Vec<SlotStatus>,
@@ -31,6 +35,7 @@ impl Status {
     /// failure: the tray is expected to sit there quietly until one starts.
     pub fn fetch() -> Self {
         let mut s = Status::default();
+        s.daemon_installed = crate::daemon::installed();
         let Ok(mut c) = Client::connect() else {
             return s;
         };

@@ -49,7 +49,15 @@ fn build_menu(status: &Status) -> Menu {
     let menu = Menu::new();
 
     if !status.daemon_running {
-        let _ = menu.append(&MenuItem::new("scurry is not running", false, None));
+        // Not installed and not started are different problems with different
+        // fixes. Saying "not running" for both sends the user looking in the
+        // wrong place.
+        if status.daemon_installed {
+            let _ = menu.append(&MenuItem::new("scurry is not running", false, None));
+        } else {
+            let _ = menu.append(&MenuItem::new("scurry is not installed", false, None));
+            let _ = menu.append(&MenuItem::new(daemon::install_hint(), false, None));
+        }
     } else {
         let where_ = if status.focus == 0 {
             "this machine".to_string()
@@ -103,10 +111,12 @@ fn build_menu(status: &Status) -> Menu {
 
     if daemon::SUPPORTED {
         let _ = menu.append(&PredefinedMenuItem::separator());
+        // Disabled until the installer has run: pressing it would only report
+        // a missing unit, which the menu already says above.
         let _ = menu.append(&MenuItem::with_id(
             MenuId::new(ID_START),
             "Start",
-            !status.daemon_running,
+            status.daemon_installed && !status.daemon_running,
             None,
         ));
         let _ = menu.append(&MenuItem::with_id(
@@ -139,7 +149,9 @@ impl App {
         let menu = build_menu(&status);
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu)));
-            let _ = tray.set_tooltip(Some(if status.daemon_running {
+            let _ = tray.set_tooltip(Some(if !status.daemon_installed {
+                "scurry — not installed".to_string()
+            } else if status.daemon_running {
                 format!("scurry — pointer on {}", if status.focus == 0 {
                     "this machine".to_string()
                 } else {
