@@ -250,9 +250,15 @@ impl ApplicationHandler for App {
         // The tray must be built after the loop is running: on macOS
         // NSStatusItem needs an initialised NSApplication, and an icon created
         // earlier never appears.
+        // Build the menu up front rather than waiting for the first refresh, so
+        // the icon is never briefly present with nothing behind it.
+        let initial = Snapshot::NoDongle;
         match icon() {
             Ok(ic) => {
-                let builder = TrayIconBuilder::new().with_tooltip("scurry").with_icon(ic);
+                let builder = TrayIconBuilder::new()
+                    .with_tooltip("scurry")
+                    .with_menu(Box::new(self.build_menu(&initial)))
+                    .with_icon(ic);
                 // A template image: macOS reads only the alpha channel and
                 // tints the glyph to match the menu bar, so it follows light
                 // and dark mode without shipping two icons. The asset is

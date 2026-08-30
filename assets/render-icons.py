@@ -56,8 +56,11 @@ def render(s, plate=True, glyph=(0xf5, 0xf6, 0xf8, 255), fill=1.0):
     # and centred rather than insetting for a background.
     c = 0.5 - (0.5 * fill)
     w = lambda f: (c + f * fill) * s
-    tri((w(.30),w(.10)), (w(.30),w(.78)), (w(.70),w(.46)), glyph)
-    tri((w(.30),w(.78)), (w(.44),w(.62)), (w(.56),w(.88)), glyph)
+    # Full-bleed: the arrow spans nearly the whole canvas, because the menu bar
+    # scales this down to roughly 16pt and anything inset from the edges
+    # disappears into a smudge at that size.
+    tri((w(.14),w(.02)), (w(.14),w(.86)), (w(.72),w(.50)), glyph)
+    tri((w(.14),w(.86)), (w(.34),w(.66)), (w(.52),w(.98)), glyph)
     return px
 
 for size in (16, 32, 48, 128, 256, 512):
@@ -66,5 +69,5 @@ for size in (16, 32, 48, 128, 256, 512):
 # Opaque black glyph, transparent everywhere else. The colour is irrelevant on
 # macOS -- only alpha is read from a template image -- but black is what a
 # non-templating panel should draw on a light background.
-png(OUT / "tray.png", 44, 44, render(44, plate=False, glyph=(0, 0, 0, 255), fill=0.92))
+png(OUT / "tray.png", 44, 44, render(44, plate=False, glyph=(0, 0, 0, 255), fill=1.0))
 print("wrote icon-{16,32,48,128,256,512}.png and tray.png (44px template)")
