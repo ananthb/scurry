@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use scurry_ctl::config::Config;
+use scurry_ctl::ipc::Client;
 use scurry_ctl::transport::{Dongle, Message};
 use scurry_proto::{ack, kind, SlotStatus};
 
@@ -24,7 +25,10 @@ commands:
   test-move           drive synthetic motion, printing everything the dongle says
 
 All configuration lives on the dongle. Nothing is stored locally, so a layout
-survives moving to another controller machine."
+survives moving to another controller machine.
+
+Commands reach the dongle through the running app when there is one, since it
+holds the serial port exclusively, and open the port directly otherwise."
     );
     std::process::exit(2)
 }
@@ -43,10 +47,41 @@ fn main() -> Result<()> {
     }
 }
 
-fn open() -> Result<Dongle> {
+/// How the CLI reaches the dongle.
+///
+/// The app owns the serial port exclusively while it is running, so opening it
+/// directly would fail with "Device or resource busy" -- which is the normal
+/// state, not an error. Prefer the app's control socket and fall back to the
+/// port only when nothing is holding it.
+enum Link {
+    Socket(Client),
+    Serial(Dongle),
+}
+
+fn open_link() -> Result<Link> {
+    if let Ok(client) = Client::connect() {
+        eprintln!("via the running app");
+        return Ok(Link::Socket(client));
+    }
     let path = Dongle::autodetect()?;
     eprintln!("dongle: {path}");
-    Dongle::open(&path)
+    Ok(Link::Serial(Dongle::open(&path)?))
+}
+
+impl Link {
+    /// Send a request and wait for a specific reply kind.
+    fn request(&mut self, req: u8, payload: &[u8], want: u8) -> Result<Message> {
+        match self {
+            Link::Socket(c) => {
+                let (kind, payload) = c.request(req, payload)?;
+                if kind == want || kind == kind::ACK {
+                    return Ok(Message { kind, payload });
+                }
+                bail!("unexpected reply {kind:#04x}")
+            }
+            Link::Serial(d) => request(d, req, payload, want),
+        }
+    }
 }
 
 /// Send a request and wait for a specific reply kind.
@@ -85,7 +120,10 @@ fn ack_name(code: u8) -> &'static str {
 fn run() -> Result<()> {
     use std::sync::{Arc, Mutex};
 
-    let dongle = Arc::new(Mutex::new(open()?));
+    // Headless capture owns the port itself; there is no app to defer to.
+    let path = Dongle::autodetect()?;
+    eprintln!("dongle: {path}");
+    let dongle = Arc::new(Mutex::new(Dongle::open(&path)?));
     let state = Arc::new(scurry_ctl::ipc::DaemonState::default());
 
     // The control socket runs alongside capture so the tray can reach the
@@ -117,8 +155,7 @@ fn probe() -> Result<()> {
 }
 
 fn ping() -> Result<()> {
-    let mut d = open()?;
-    request(&mut d, kind::PING, &[], kind::PONG)?;
+    open_link()?.request(kind::PING, &[], kind::PONG)?;
     println!("dongle responded");
     Ok(())
 }
@@ -130,7 +167,11 @@ fn ping() -> Result<()> {
 /// output is visible while it happens.
 fn test_move() -> Result<()> {
     use scurry_proto::MouseState;
-    let mut d = open()?;
+    // Deliberately direct: synthetic motion is for testing the serial path
+    // itself, so going through the app would defeat the point.
+    let path = Dongle::autodetect()?;
+    eprintln!("dongle: {path}");
+    let mut d = Dongle::open(&path)?;
     let mut on_log = |line: &str| eprintln!("[dongle] {line}");
 
     eprintln!("sweeping right, then back left");
@@ -161,8 +202,7 @@ fn test_move() -> Result<()> {
 }
 
 fn status() -> Result<()> {
-    let mut d = open()?;
-    let msg = request(&mut d, kind::GET_STATUS, &[], kind::STATUS)?;
+    let msg = open_link()?.request(kind::GET_STATUS, &[], kind::STATUS)?;
     if msg.payload.is_empty() {
         bail!("empty status payload");
     }
@@ -188,8 +228,7 @@ fn status() -> Result<()> {
 }
 
 fn get_config() -> Result<()> {
-    let mut d = open()?;
-    let msg = request(&mut d, kind::GET_CONFIG, &[], kind::CONFIG)?;
+    let msg = open_link()?.request(kind::GET_CONFIG, &[], kind::CONFIG)?;
     if msg.payload.first().copied().unwrap_or(0) == 0 {
         eprintln!("the dongle has no layout stored yet");
         return Ok(());
@@ -203,8 +242,7 @@ fn set_config(path: &str) -> Result<()> {
     // Validated here for a specific error message; the dongle validates again
     // before it commits anything to storage.
     let payload = cfg.to_payload()?;
-    let mut d = open()?;
-    let msg = request(&mut d, kind::SET_CONFIG, &payload, kind::ACK)?;
+    let msg = open_link()?.request(kind::SET_CONFIG, &payload, kind::ACK)?;
     let code = msg.payload.first().copied().unwrap_or(ack::BAD_REQUEST);
     if code != ack::OK {
         bail!("dongle rejected the layout: {}", ack_name(code));

@@ -83,6 +83,20 @@ impl App {
 
     /// Try to attach to a dongle, and start capture once one is there.
     fn try_attach(&mut self) {
+        // Already attached, but capture never started -- retry it, so granting
+        // Accessibility takes effect on the next poll rather than needing the
+        // app to be restarted.
+        #[cfg(target_os = "macos")]
+        if self.link.is_some() && self._tap.is_none() {
+            if let Some(link) = &self.link {
+                if let Ok(tap) =
+                    scurry_ctl::capture::install(Arc::clone(link), Arc::clone(&self.state))
+                {
+                    eprintln!("capture started");
+                    self._tap = Some(tap);
+                }
+            }
+        }
         if self.link.is_some() {
             return;
         }
@@ -96,8 +110,13 @@ impl App {
             match scurry_ctl::capture::install(Arc::clone(&link), Arc::clone(&self.state)) {
                 Ok(tap) => self._tap = Some(tap),
                 Err(e) => {
-                    eprintln!("could not start capture: {e}");
-                    return;
+                    // Almost always missing Accessibility permission. Do NOT
+                    // give up here: returning early left the app holding the
+                    // serial port while serving nothing -- capture dead, no
+                    // control socket, and the CLI locked out of a port it could
+                    // otherwise have used. Carry on without capture; settings
+                    // and status still work, and the next poll retries.
+                    eprintln!("capture unavailable, continuing without it: {e}");
                 }
             }
         }
