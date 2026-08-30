@@ -72,15 +72,22 @@ impl DaemonState {
         }
     }
 
-    /// Send a request and wait for the reader thread to hand back the answer.
+    /// Send a request and wait for a reply of the kind it asked for.
     ///
-    /// Queries are rare and serialised by this lock, which is why one reply
-    /// slot suffices: there is never more than one in flight.
+    /// `want` is not decoration. There are two independent queriers -- the
+    /// tray's status poller and the control socket -- and a reply that arrives
+    /// after its own request timed out would otherwise be handed to whoever is
+    /// waiting next. That is exactly what happened: a SET_CONFIG came back with
+    /// 0x14 STATUS, the poller's late answer. Replies whose kind was not asked
+    /// for are discarded rather than returned.
+    ///
+    /// ACK is always accepted, since it is how the dongle refuses anything.
     pub fn request(
         &self,
         link: &Mutex<Dongle>,
         kind: u8,
         payload: &[u8],
+        want: u8,
         timeout: Duration,
     ) -> Result<(u8, Vec<u8>)> {
         let mut slot = self
@@ -90,20 +97,32 @@ impl DaemonState {
         *slot = None;
 
         {
-            // Held only for the write, so pointer motion is never waiting on a
+            // Held only for the write, so pointer motion never waits on a
             // config query.
             let mut guard = link.lock().map_err(|_| anyhow::anyhow!("link poisoned"))?;
             guard.send(kind, payload)?;
         }
 
-        let (slot, timed_out) = self
-            .arrived
-            .wait_timeout_while(slot, timeout, |s| s.is_none())
-            .map_err(|_| anyhow::anyhow!("reply slot poisoned"))?;
-        if timed_out.timed_out() {
-            anyhow::bail!("the dongle did not answer a {kind:#04x} within {timeout:?}");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("the dongle did not answer a {kind:#04x} within {timeout:?}");
+            }
+            let (mut got, timed_out) = self
+                .arrived
+                .wait_timeout_while(slot, remaining, |s| s.is_none())
+                .map_err(|_| anyhow::anyhow!("reply slot poisoned"))?;
+            if timed_out.timed_out() {
+                anyhow::bail!("the dongle did not answer a {kind:#04x} within {timeout:?}");
+            }
+            match got.take() {
+                Some((k, p)) if k == want || k == kind::ACK => return Ok((k, p)),
+                // Somebody else's answer, arriving late. Keep waiting for ours.
+                Some(_) => slot = got,
+                None => slot = got,
+            }
         }
-        slot.clone().ok_or_else(|| anyhow::anyhow!("woken with no reply"))
     }
 }
 
@@ -148,8 +167,13 @@ fn handle(mut stream: UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonSta
         }
         // Anything else is for the dongle. Forward it and relay the answer.
         _ => {
-            let (k, p) = state.request(dongle, h.kind, &payload, Duration::from_secs(3))?;
-            let _ = kind::ACK;
+            let want = match h.kind {
+                kind::GET_CONFIG => kind::CONFIG,
+                kind::GET_STATUS => kind::STATUS,
+                kind::PING => kind::PONG,
+                _ => kind::ACK,
+            };
+            let (k, p) = state.request(dongle, h.kind, &payload, want, Duration::from_secs(3))?;
             reply(&mut stream, k, &p)
         }
     }

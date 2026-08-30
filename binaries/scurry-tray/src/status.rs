@@ -74,7 +74,7 @@ pub fn spawn_poller(
         let mut screens = Vec::new();
         let mut slots = Vec::new();
 
-        if let Ok((k, p)) = state.request(&link, kind::GET_CONFIG, &[], Duration::from_secs(2)) {
+        if let Ok((k, p)) = state.request(&link, kind::GET_CONFIG, &[], kind::CONFIG, Duration::from_secs(2)) {
             if k == kind::CONFIG {
                 if let Ok(cfg) = Config::from_payload(&p) {
                     screens = cfg
@@ -90,7 +90,7 @@ pub fn spawn_poller(
                 }
             }
         }
-        if let Ok((k, p)) = state.request(&link, kind::GET_STATUS, &[], Duration::from_secs(2)) {
+        if let Ok((k, p)) = state.request(&link, kind::GET_STATUS, &[], kind::STATUS, Duration::from_secs(2)) {
             if k == kind::STATUS && !p.is_empty() {
                 let count = p[0] as usize;
                 for i in 0..count {
