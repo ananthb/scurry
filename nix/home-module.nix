@@ -67,12 +67,25 @@ in
           # Rust's linker leaves an ad-hoc signature on the binary alone, with
           # the Info.plist unbound -- so codesign reports Identifier=scurry-tray
           # rather than com.ananthb.scurry-tray, and macOS sees a bare
-          # executable instead of an app with a bundle identity. Accessibility
-          # is granted against that identity, so without this the permission
-          # cannot stick and the app waits for access forever no matter how many
-          # times the checkbox is ticked.
-          $DRY_RUN_CMD /usr/bin/codesign --force --deep --sign - "$app_dst" \
-            >/dev/null 2>&1 || true
+          # executable rather than an app with a bundle identity. Accessibility
+          # is granted against that identity, so without signing the bundle the
+          # permission cannot stick however many times it is granted.
+          #
+          # Prefer a local certificate over an ad-hoc signature. Ad-hoc is keyed
+          # by cdhash, so every rebuild is a new identity and the grant is
+          # silently revoked; a certificate makes the designated requirement
+          # depend on the bundle id and the certificate instead, so it survives.
+          # Create one with nix/setup-signing.sh.
+          if /usr/bin/security find-identity -v -p codesigning 2>/dev/null \
+              | grep -q scurry-local-signing; then
+            $DRY_RUN_CMD /usr/bin/codesign --force --deep \
+              --sign scurry-local-signing "$app_dst" >/dev/null 2>&1 || true
+          else
+            echo "scurry: no local signing identity; Accessibility will need" \
+                 "re-granting after each rebuild. Run nix/setup-signing.sh." >&2
+            $DRY_RUN_CMD /usr/bin/codesign --force --deep --sign - "$app_dst" \
+              >/dev/null 2>&1 || true
+          fi
         fi
       '');
 
