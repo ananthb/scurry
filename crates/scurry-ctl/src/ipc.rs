@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use scurry_proto::{kind, Header, HEADER_LEN, MAGIC, MAX_PAYLOAD, VERSION};
+use scurry_proto::{ack, kind, Header, HEADER_LEN, MAGIC, MAX_PAYLOAD, VERSION};
 
 use crate::transport::Dongle;
 
@@ -143,14 +143,21 @@ pub fn serve(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> 
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if let Err(e) = handle(stream, &dongle, &state) {
+        // On error the connection used to just close, so the client saw EAGAIN
+        // reading a reply header that was never coming -- "Resource temporarily
+        // unavailable", which says nothing about what went wrong. Answer with a
+        // refusal instead, so the caller gets a reason.
+        if let Err(e) = handle(&stream, &dongle, &state) {
             eprintln!("control socket client: {e}");
+            let mut s = &stream;
+            let _ = reply(&mut s, kind::ACK, &[ack::BAD_REQUEST]);
         }
     }
     Ok(())
 }
 
-fn handle(mut stream: UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonState) -> Result<()> {
+fn handle(stream: &UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonState) -> Result<()> {
+    let mut stream = stream;
     let mut header = [0u8; HEADER_LEN];
     stream.read_exact(&mut header).context("reading request header")?;
     let h = Header::decode(&header).map_err(|e| anyhow::anyhow!("bad request header: {e:?}"))?;
@@ -179,7 +186,7 @@ fn handle(mut stream: UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonSta
     }
 }
 
-fn reply(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> Result<()> {
+fn reply(stream: &mut &UnixStream, kind: u8, payload: &[u8]) -> Result<()> {
     let header = Header::encode(kind, 0, payload.len() as u16);
     stream.write_all(&header)?;
     stream.write_all(payload)?;
