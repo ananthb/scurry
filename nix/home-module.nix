@@ -61,6 +61,18 @@ in
           $DRY_RUN_CMD cp -RL "$app_src" "$app_dst"
           $DRY_RUN_CMD chmod -R u+w "$app_dst"
           $DRY_RUN_CMD xattr -dr com.apple.quarantine "$app_dst" 2>/dev/null || true
+
+          # Sign the bundle, not just the executable.
+          #
+          # Rust's linker leaves an ad-hoc signature on the binary alone, with
+          # the Info.plist unbound -- so codesign reports Identifier=scurry-tray
+          # rather than com.ananthb.scurry-tray, and macOS sees a bare
+          # executable instead of an app with a bundle identity. Accessibility
+          # is granted against that identity, so without this the permission
+          # cannot stick and the app waits for access forever no matter how many
+          # times the checkbox is ticked.
+          $DRY_RUN_CMD /usr/bin/codesign --force --deep --sign - "$app_dst" \
+            >/dev/null 2>&1 || true
         fi
       '');
 
