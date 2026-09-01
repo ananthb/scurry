@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/ringbuf.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -31,6 +32,8 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "scurry_ffi.h"
+#include "esp_gatt_common_api.h"
+#include "scurry_ctl_svc.h"
 
 /**
  * Brief:
@@ -60,6 +63,14 @@ static uint16_t hid_conn_id = 0;
    connect, so a second host silently displaced the first. Track them all --
    the point of this spike is to see how many survive at once. */
 #define SCURRY_MAX_HOSTS 4
+
+/* Total live connections, targets and controller together. The connection table
+   counts only targets, so it cannot answer "is there room for another link" --
+   and with the controller occupying one of the four the radio allows, the
+   wireless answer is three targets rather than four. */
+static int scurry_total_conns = 0;
+#define SCURRY_ACL_LIMIT 4
+
 static uint16_t      scurry_conns[SCURRY_MAX_HOSTS];
 static bool          scurry_conn_used[SCURRY_MAX_HOSTS];
 /* The disconnect event reports only remote_bda, never conn_id (connect gives
@@ -90,6 +101,19 @@ static void scurry_publish_available(void)
 
 static void scurry_conn_add(uint16_t conn_id, esp_bd_addr_t bda)
 {
+    /* The wireless controller connects as an ordinary central, so it arrives
+       here looking exactly like a target. Seating it would cost a screen slot
+       and, worse, route the pointer to the very machine the pointer came from.
+       Observed: a Mac bonding for the control link took node 1 and displaced
+       the phone that was pinned to it. */
+    esp_bd_addr_t controller;
+    if (scurry_ctl_svc_pinned(controller) &&
+        memcmp(controller, bda, sizeof(esp_bd_addr_t)) == 0) {
+        ESP_LOGI(HID_DEMO_TAG, "scurry: %02x:%02x:%02x:%02x:%02x:%02x is the controller, not a target",
+                 bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+        return;
+    }
+
     /* Prefer the node the layout pinned to this address. Slots used to be
        handed out in connection order, so after a reboot whichever machine won
        the race took node 1 -- silently swapping two screens, with the pointer
@@ -240,14 +264,19 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
 		case ESP_HIDD_EVENT_BLE_CONNECT: {
             ESP_LOGI(HID_DEMO_TAG, "ESP_HIDD_EVENT_BLE_CONNECT");
             hid_conn_id = param->connect.conn_id;
+            scurry_total_conns++;
             scurry_conn_add(param->connect.conn_id, param->connect.remote_bda);
-            ESP_LOGW(HID_DEMO_TAG, "scurry: conn_id=%d, %d host(s) connected",
-                     param->connect.conn_id, scurry_conn_count());
+            ESP_LOGW(HID_DEMO_TAG, "scurry: conn_id=%d, %d host(s), %d link(s) total",
+                     param->connect.conn_id, scurry_conn_count(), scurry_total_conns);
             /* Keep advertising so a second target can find and bond with us.
                Without this the dongle stops being discoverable at one host and
                could never reach a second -- which would fail the spike for a
-               reason that has nothing to do with whether BLE supports it. */
-            if (scurry_conn_count() < SCURRY_MAX_HOSTS) {
+               reason that has nothing to do with whether BLE supports it.
+
+               Bounded by the radio's link limit rather than the screen count:
+               a wireless controller holds one of those links, which is what
+               makes wireless mode three targets instead of four. */
+            if (scurry_total_conns < SCURRY_ACL_LIMIT) {
                 esp_ble_gap_start_advertising(&hidd_adv_params);
             }
             break;
@@ -256,6 +285,10 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
             sec_conn = false;
             ESP_LOGI(HID_DEMO_TAG, "ESP_HIDD_EVENT_BLE_DISCONNECT");
             scurry_conn_remove(param->disconnect.remote_bda);
+            scurry_ctl_svc_on_disconnect(param->disconnect.remote_bda);
+            if (scurry_total_conns > 0) {
+                scurry_total_conns--;
+            }
             ESP_LOGW(HID_DEMO_TAG, "scurry: disconnect, %d host(s) remain",
                      scurry_conn_count());
             esp_ble_gap_start_advertising(&hidd_adv_params);
@@ -342,6 +375,13 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_KIND_GET_STATUS  0x13
 #define SCURRY_KIND_STATUS      0x14
 #define SCURRY_KIND_ACK         0x15
+#define SCURRY_KIND_GET_WIRELESS 0x16
+#define SCURRY_KIND_WIRELESS     0x17
+#define SCURRY_KIND_SET_WIRELESS 0x18
+
+/* SET_WIRELESS operations. */
+#define SCURRY_WIRELESS_FORGET 0
+#define SCURRY_WIRELESS_PAIR   1
 
 #define SCURRY_ACK_OK              0
 #define SCURRY_ACK_BAD_REQUEST     1
@@ -350,6 +390,13 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
 #define SCURRY_NVS_NAMESPACE  "scurry"
 #define SCURRY_NVS_KEY_LAYOUT "layout"
+
+/* Where an outbound frame goes. Announcements go everywhere; a reply goes back
+   the way its request arrived, so a query over the cable is not answered into
+   the air and vice versa. */
+#define SCURRY_TO_USB 0x01
+#define SCURRY_TO_BLE 0x02
+static uint8_t scurry_reply_to = SCURRY_TO_USB;
 
 static uint16_t scurry_tx_seq = 0;
 static uint8_t  scurry_focus_node = 0;
@@ -398,27 +445,58 @@ static bool scurry_seq_accept(uint16_t seq)
     return false;
 }
 
+/* Only the reader task emits, so one shared buffer is enough and a 520-byte
+   frame does not have to live on its stack. */
+static uint8_t scurry_tx_buf[SCURRY_HEADER_LEN + SCURRY_MAX_PAYLOAD];
+
+static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint16_t len)
+{
+    if (len > SCURRY_MAX_PAYLOAD) {
+        return;
+    }
+    uint8_t *h = scurry_tx_buf;
+    memset(h, 0, SCURRY_HEADER_LEN);
+    h[0] = SCURRY_MAGIC;
+    h[1] = SCURRY_VERSION;
+    h[2] = kind;
+    h[4] = (uint8_t)(scurry_tx_seq & 0xFF);
+    h[5] = (uint8_t)(scurry_tx_seq >> 8);
+    h[6] = (uint8_t)(len & 0xFF);
+    h[7] = (uint8_t)(len >> 8);
+    scurry_tx_seq++;
+    if (len > 0 && payload != NULL) {
+        memcpy(h + SCURRY_HEADER_LEN, payload, len);
+    }
+    uint16_t total = SCURRY_HEADER_LEN + len;
+
+    if (dest & SCURRY_TO_USB) {
+        /* 20ms, not 100: with the dongle on a wall wart and no host draining
+           the port, every write would otherwise stall the reader task for a
+           tenth of a second. Dropping the frame is safe now that focus is
+           re-announced rather than sent once. */
+        usb_serial_jtag_write_bytes(h, total, 20 / portTICK_PERIOD_MS);
+    }
+    if (dest & SCURRY_TO_BLE) {
+        scurry_ctl_svc_notify(h, total);
+    }
+}
+
+/* An announcement: both transports, because either may be carrying a
+   controller that needs to hear it. */
 static void scurry_send(uint8_t kind, const uint8_t *payload, uint16_t len)
 {
-    uint8_t header[SCURRY_HEADER_LEN] = {0};
-    header[0] = SCURRY_MAGIC;
-    header[1] = SCURRY_VERSION;
-    header[2] = kind;
-    header[4] = (uint8_t)(scurry_tx_seq & 0xFF);
-    header[5] = (uint8_t)(scurry_tx_seq >> 8);
-    header[6] = (uint8_t)(len & 0xFF);
-    header[7] = (uint8_t)(len >> 8);
-    scurry_tx_seq++;
+    scurry_emit(SCURRY_TO_USB | SCURRY_TO_BLE, kind, payload, len);
+}
 
-    usb_serial_jtag_write_bytes(header, sizeof(header), 100 / portTICK_PERIOD_MS);
-    if (len > 0 && payload != NULL) {
-        usb_serial_jtag_write_bytes(payload, len, 100 / portTICK_PERIOD_MS);
-    }
+/* An answer: back to whoever asked. */
+static void scurry_reply(uint8_t kind, const uint8_t *payload, uint16_t len)
+{
+    scurry_emit(scurry_reply_to, kind, payload, len);
 }
 
 static void scurry_send_ack(uint8_t code)
 {
-    scurry_send(SCURRY_KIND_ACK, &code, 1);
+    scurry_reply(SCURRY_KIND_ACK, &code, 1);
 }
 
 /* Tell the controller where the pointer is. Without this it cannot know whether
@@ -675,10 +753,10 @@ static void scurry_send_config(void)
         /* Not configured yet: an empty config is a valid answer, and lets the
            controller distinguish "none stored" from "link is broken". */
         uint8_t empty = 0;
-        scurry_send(SCURRY_KIND_CONFIG, &empty, 1);
+        scurry_reply(SCURRY_KIND_CONFIG, &empty, 1);
         return;
     }
-    scurry_send(SCURRY_KIND_CONFIG, buf, (uint16_t)n);
+    scurry_reply(SCURRY_KIND_CONFIG, buf, (uint16_t)n);
 }
 
 static void scurry_send_status(void)
@@ -691,7 +769,7 @@ static void scurry_send_status(void)
         e[1] = scurry_conn_used[i] ? 1 : 0;
         memcpy(&e[2], scurry_conn_bda[i], 6);
     }
-    scurry_send(SCURRY_KIND_STATUS, buf, sizeof(buf));
+    scurry_reply(SCURRY_KIND_STATUS, buf, sizeof(buf));
 }
 
 /* Re-resolve every live connection against the current layout.
@@ -777,8 +855,61 @@ static void scurry_handle_set_config(const uint8_t *p, uint16_t len)
     scurry_send_ack(SCURRY_ACK_OK);
 }
 
-static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, uint16_t len)
+/* Report the wireless link's state: whether a controller is live, whether one
+   is pinned, and how long any pairing window has left. */
+static void scurry_send_wireless(void)
 {
+    uint8_t buf[9] = {0};
+    esp_bd_addr_t bda;
+    buf[0] = scurry_ctl_svc_ready() ? 1 : 0;
+    buf[1] = scurry_ctl_svc_pinned(bda) ? 1 : 0;
+    if (buf[1]) {
+        memcpy(&buf[2], bda, 6);
+    }
+    uint32_t left = scurry_ctl_svc_pairing_remaining();
+    buf[8] = left > 255 ? 255 : (uint8_t)left;
+    scurry_reply(SCURRY_KIND_WIRELESS, buf, sizeof(buf));
+}
+
+/* Open a pairing window, or forget the controller entirely.
+ *
+ * Deliberately refused over the air. Authorising a new controller is exactly
+ * the power an attacker would want, so it is granted only through the cable --
+ * which means it still takes physical access, as it did when the cable was the
+ * only path at all. */
+static void scurry_handle_set_wireless(const uint8_t *p, uint16_t len)
+{
+    if (len < 1) {
+        scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
+        return;
+    }
+    if (scurry_reply_to != SCURRY_TO_USB) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: refusing to change pairing over the wireless link");
+        scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
+        return;
+    }
+    switch (p[0]) {
+    case SCURRY_WIRELESS_FORGET:
+        scurry_ctl_svc_forget();
+        scurry_send_ack(SCURRY_ACK_OK);
+        break;
+    case SCURRY_WIRELESS_PAIR: {
+        uint32_t seconds = (len >= 2 && p[1] > 0) ? p[1] : 60;
+        scurry_ctl_svc_open_pairing(seconds);
+        scurry_send_ack(SCURRY_ACK_OK);
+        break;
+    }
+    default:
+        scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
+        break;
+    }
+}
+
+static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, uint16_t len,
+                          uint8_t via)
+{
+    scurry_reply_to = via;
+
     /* Only the pointer stream is sequence-gated. Control messages are rare and
        must not be dropped for arriving out of order behind a burst of motion. */
     if (kind == SCURRY_KIND_MOUSE) {
@@ -798,7 +929,7 @@ static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, ui
 
     switch (kind) {
     case SCURRY_KIND_PING:
-        scurry_send(SCURRY_KIND_PONG, NULL, 0);
+        scurry_reply(SCURRY_KIND_PONG, NULL, 0);
         break;
     case SCURRY_KIND_GET_CONFIG:
         scurry_send_config();
@@ -809,10 +940,101 @@ static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, ui
     case SCURRY_KIND_GET_STATUS:
         scurry_send_status();
         break;
+    case SCURRY_KIND_GET_WIRELESS:
+        scurry_send_wireless();
+        break;
+    case SCURRY_KIND_SET_WIRELESS:
+        scurry_handle_set_wireless(payload, len);
+        break;
     default:
         ESP_LOGD(HID_DEMO_TAG, "scurry: unhandled kind 0x%02x", kind);
         scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
         break;
+    }
+}
+
+/* Frame reassembly for one transport.
+ *
+ * Both the cable and the wireless link deliver a byte stream, not messages: USB
+ * reads land in whatever chunks the host writes, and a BLE write is bounded by
+ * the negotiated MTU, which no config payload fits inside. One of these per
+ * transport, because interleaving two streams into one buffer would splice
+ * frames together. */
+typedef struct {
+    uint8_t buf[SCURRY_HEADER_LEN + SCURRY_MAX_PAYLOAD];
+    size_t filled;
+} scurry_framer_t;
+
+static void scurry_framer_feed(scurry_framer_t *f, const uint8_t *data, size_t len, uint8_t via)
+{
+    while (len > 0) {
+        size_t room = sizeof(f->buf) - f->filled;
+        if (room == 0) {
+            /* No parsable frame in a full buffer: drop it rather than wedge
+               with nowhere to put the next byte. */
+            f->filled = 0;
+            room = sizeof(f->buf);
+        }
+        size_t take = len < room ? len : room;
+        memcpy(f->buf + f->filled, data, take);
+        f->filled += take;
+        data += take;
+        len -= take;
+
+        size_t off = 0;
+        while (f->filled - off >= SCURRY_HEADER_LEN) {
+            const uint8_t *h = f->buf + off;
+            /* Resynchronise a byte at a time on the magic. A dropped or
+               spurious byte otherwise desynchronises the stream permanently. */
+            if (h[0] != SCURRY_MAGIC || h[1] != SCURRY_VERSION) {
+                off++;
+                continue;
+            }
+            uint16_t flen = (uint16_t)h[6] | ((uint16_t)h[7] << 8);
+            if (flen > SCURRY_MAX_PAYLOAD) {
+                off++; /* corrupt: treat as a false magic rather than trusting it */
+                continue;
+            }
+            if (f->filled - off < (size_t)SCURRY_HEADER_LEN + flen) {
+                break; /* payload still in flight */
+            }
+            uint16_t seq = (uint16_t)h[4] | ((uint16_t)h[5] << 8);
+            scurry_handle(h[2], seq, h + SCURRY_HEADER_LEN, flen, via);
+            off += SCURRY_HEADER_LEN + flen;
+        }
+
+        if (off > 0) {
+            memmove(f->buf, f->buf + off, f->filled - off);
+            f->filled -= off;
+        }
+    }
+}
+
+static scurry_framer_t scurry_usb_framer;
+static scurry_framer_t scurry_ble_framer;
+
+/* Bytes the wireless controller has written, waiting for the reader task.
+ *
+ * The GATT write callback runs on the Bluedroid task. Handling a frame there
+ * would put a second thread on the layout engine -- which is documented as
+ * single-threaded, holds the pointer position in a static, and is reached from
+ * the reader task on every mouse message -- and on the shared transmit buffer
+ * and sequence counter. So the callback only hands the bytes over, and every
+ * frame from either transport is still parsed and acted on by one task. */
+static RingbufHandle_t scurry_ble_rb;
+
+static void scurry_ble_rx(const uint8_t *data, uint16_t len)
+{
+    if (scurry_ble_rb == NULL) {
+        return;
+    }
+    /* No wait: the pointer stream must not block the Bluetooth task, and a
+       dropped mouse frame is repaired by the next one. */
+    if (xRingbufferSend(scurry_ble_rb, data, len, 0) != pdTRUE) {
+        static uint32_t dropped = 0;
+        if ((dropped++ % 100) == 0) {
+            ESP_LOGW(HID_DEMO_TAG, "scurry: wireless receive buffer full, dropping");
+        }
     }
 }
 
@@ -828,46 +1050,35 @@ void scurry_reader_task(void *pvParameters)
     }
     ESP_LOGI(HID_DEMO_TAG, "scurry: reading protocol v%d from USB Serial/JTAG", SCURRY_VERSION);
 
-    static uint8_t buf[SCURRY_HEADER_LEN + SCURRY_MAX_PAYLOAD];
-    size_t filled = 0;
-
+    static uint8_t chunk[256];
     while (1) {
-        int n = usb_serial_jtag_read_bytes(buf + filled, sizeof(buf) - filled,
-                                           20 / portTICK_PERIOD_MS);
-        if (n <= 0) {
-            continue;
-        }
-        filled += (size_t)n;
-
-        size_t off = 0;
-        while (filled - off >= SCURRY_HEADER_LEN) {
-            const uint8_t *h = buf + off;
-            /* Resynchronise a byte at a time on the magic. A dropped or
-               spurious byte otherwise desynchronises the stream permanently. */
-            if (h[0] != SCURRY_MAGIC || h[1] != SCURRY_VERSION) {
-                off++;
-                continue;
-            }
-            uint16_t len = (uint16_t)h[6] | ((uint16_t)h[7] << 8);
-            if (len > SCURRY_MAX_PAYLOAD) {
-                off++; /* corrupt: treat as a false magic rather than trusting it */
-                continue;
-            }
-            if (filled - off < (size_t)SCURRY_HEADER_LEN + len) {
-                break; /* payload still in flight */
-            }
-            uint16_t seq = (uint16_t)h[4] | ((uint16_t)h[5] << 8);
-            scurry_handle(h[2], seq, h + SCURRY_HEADER_LEN, len);
-            off += SCURRY_HEADER_LEN + len;
+        /* pdMS_TO_TICKS, and never less than one tick: the tick is 10ms here,
+           so a raw `5 / portTICK_PERIOD_MS` truncates to zero, the read stops
+           blocking, and this loop spins at 100% until the task watchdog fires.
+           It returns the moment bytes arrive either way, so the cable keeps the
+           latency it always had; the wireless queue is drained without waiting,
+           and its worst case is one tick. */
+        TickType_t wait = pdMS_TO_TICKS(10);
+        int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), wait > 0 ? wait : 1);
+        if (n > 0) {
+            scurry_framer_feed(&scurry_usb_framer, chunk, (size_t)n, SCURRY_TO_USB);
         }
 
-        if (off > 0) {
-            memmove(buf, buf + off, filled - off);
-            filled -= off;
-        } else if (filled == sizeof(buf)) {
-            /* A full buffer with no parsable message: drop it rather than
-               deadlock with no room to read more. */
-            filled = 0;
+        if (scurry_ble_rb != NULL) {
+            size_t got = 0;
+            uint8_t *item = (uint8_t *)xRingbufferReceive(scurry_ble_rb, &got, 0);
+            if (item != NULL) {
+                /* A controller that has identified itself must not also hold a
+                   target slot: it connected as an ordinary central and was
+                   seated as one before it said what it was. Idempotent, so this
+                   costs four memcmps once and nothing after. */
+                esp_bd_addr_t bda;
+                if (scurry_ctl_svc_conn(NULL, bda)) {
+                    scurry_conn_remove(bda);
+                }
+                scurry_framer_feed(&scurry_ble_framer, item, got, SCURRY_TO_BLE);
+                vRingbufferReturnItem(scurry_ble_rb, item);
+            }
         }
     }
 }
@@ -923,9 +1134,29 @@ void app_main(void)
         ESP_LOGE(HID_DEMO_TAG, "%s init bluedroid failed", __func__);
     }
 
+
     ///register the callback function to the gap module
     esp_ble_gap_register_callback(gap_event_handler);
     esp_hidd_register_callbacks(hidd_event_callback);
+
+    /* The wireless control link. Experimental: the cable remains the
+       configuration path, the fallback, and the only way to authorise a
+       controller.
+
+       After esp_hidd_register_callbacks, not before: that is what installs the
+       GATTS callback, and an app registered ahead of it has its registration
+       event delivered to nobody -- the service then silently never exists. */
+    scurry_ble_rb = xRingbufferCreate(1024, RINGBUF_TYPE_BYTEBUF);
+    if (scurry_ble_rb == NULL) {
+        ESP_LOGE(HID_DEMO_TAG, "scurry: no memory for the wireless receive buffer");
+    }
+    scurry_ctl_svc_init(scurry_ble_rx);
+    /* Ask for a large MTU so a config reply is a handful of notifications
+       rather than dozens. Hosts negotiate downwards; macOS settles near 185. */
+    esp_ble_gatt_set_local_mtu(247);
+    if (esp_ble_gatts_app_register(SCURRY_CTL_APP_ID) != ESP_OK) {
+        ESP_LOGE(HID_DEMO_TAG, "scurry: could not register the control service");
+    }
 
     /* set the security iocap & auth_req & key size & init key response key parameters to the stack*/
     esp_ble_auth_req_t auth_req = ESP_LE_AUTH_BOND;     //bonding with peer device after authentication

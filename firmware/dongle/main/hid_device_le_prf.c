@@ -5,6 +5,7 @@
  */
 
 #include "hidd_le_prf_int.h"
+#include "scurry_ctl_svc.h"
 #include <string.h>
 #include "esp_log.h"
 
@@ -144,8 +145,11 @@ enum
 
 #define HI_UINT16(a) (((a) >> 8) & 0xFF)
 #define LO_UINT16(a) ((a) & 0xFF)
-#define PROFILE_NUM            1
+#define PROFILE_NUM            2
 #define PROFILE_APP_IDX        0
+/* The wireless control link, registered under its own app id so its events
+   are routed by gatts_if rather than shared with the HID profile. */
+#define PROFILE_SCURRY_CTL_IDX 1
 
 struct gatts_profile_inst {
     esp_gatts_cb_t gatts_cb;
@@ -672,7 +676,10 @@ static struct gatts_profile_inst heart_rate_profile_tab[PROFILE_NUM] = {
         .gatts_cb = esp_hidd_prf_cb_hdl,
         .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
     },
-
+    [PROFILE_SCURRY_CTL_IDX] = {
+        .gatts_cb = scurry_ctl_svc_gatts_event,
+        .gatts_if = ESP_GATT_IF_NONE,
+    },
 };
 
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -681,7 +688,14 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     /* If event is register event, store the gatts_if for each profile */
     if (event == ESP_GATTS_REG_EVT) {
         if (param->reg.status == ESP_GATT_OK) {
-            heart_rate_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
+            /* By app id, not unconditionally. Upstream had one profile and could
+               assume every registration was its own; with two, assigning blindly
+               would leave both entries naming whichever registered last. */
+            if (param->reg.app_id == SCURRY_CTL_APP_ID) {
+                heart_rate_profile_tab[PROFILE_SCURRY_CTL_IDX].gatts_if = gatts_if;
+            } else {
+                heart_rate_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
+            }
         } else {
             ESP_LOGI(HID_LE_PRF_TAG, "Reg app failed, app_id %04x, status %d",
                     param->reg.app_id,
