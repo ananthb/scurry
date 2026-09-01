@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use scurry_ctl::config::Config;
-use scurry_ctl::ipc::Client;
+use scurry_ctl::ipc::{ack_message, Client};
 use scurry_ctl::transport::{Dongle, Message};
 use scurry_proto::{ack, kind, SlotStatus};
 
@@ -74,13 +74,31 @@ impl Link {
         match self {
             Link::Socket(c) => {
                 let (kind, payload) = c.request(req, payload)?;
-                if kind == want || kind == kind::ACK {
+                if kind == want {
                     return Ok(Message { kind, payload });
                 }
-                bail!("unexpected reply {kind:#04x}")
+                // An ACK where one was not asked for is a refusal, and it is
+                // also how the app reports that nothing answered in time. Both
+                // read as a sentence rather than the "unexpected reply 0x15"
+                // this used to print.
+                if kind == kind::ACK {
+                    bail!("{}", ack_message(&payload));
+                }
+                bail!("the app answered a {} with a {kind:#04x} message", name(req))
             }
             Link::Serial(d) => request(d, req, payload, want),
         }
+    }
+}
+
+/// A request kind in words, for messages a user reads.
+fn name(kind: u8) -> &'static str {
+    match kind {
+        kind::GET_CONFIG => "request for the layout",
+        kind::SET_CONFIG => "layout write",
+        kind::GET_STATUS => "status request",
+        kind::PING => "ping",
+        _ => "request",
     }
 }
 
@@ -99,22 +117,11 @@ fn request(d: &mut Dongle, req: u8, payload: &[u8], want: u8) -> Result<Message>
                 return Ok(msg);
             }
             if msg.kind == kind::ACK {
-                let code = msg.payload.first().copied().unwrap_or(ack::BAD_REQUEST);
-                bail!("dongle refused the request: {}", ack_name(code));
+                bail!("the dongle refused the request: {}", ack_message(&msg.payload));
             }
         }
     }
-    bail!("no reply from the dongle after 3s")
-}
-
-fn ack_name(code: u8) -> &'static str {
-    match code {
-        ack::OK => "ok",
-        ack::BAD_REQUEST => "bad request",
-        ack::INVALID_LAYOUT => "invalid layout",
-        ack::STORAGE_FAILED => "storage failed",
-        _ => "unknown error",
-    }
+    bail!("the dongle did not answer a {} within 3s", name(req))
 }
 
 fn run() -> Result<()> {
@@ -243,9 +250,8 @@ fn set_config(path: &str) -> Result<()> {
     // before it commits anything to storage.
     let payload = cfg.to_payload()?;
     let msg = open_link()?.request(kind::SET_CONFIG, &payload, kind::ACK)?;
-    let code = msg.payload.first().copied().unwrap_or(ack::BAD_REQUEST);
-    if code != ack::OK {
-        bail!("dongle rejected the layout: {}", ack_name(code));
+    if msg.payload.first().copied().unwrap_or(ack::BAD_REQUEST) != ack::OK {
+        bail!("the layout was not stored: {}", ack_message(&msg.payload));
     }
     println!("stored {} screens on the dongle", cfg.screens.len());
     Ok(())

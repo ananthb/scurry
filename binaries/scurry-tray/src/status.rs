@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use scurry_ctl::config::Config;
-use scurry_ctl::ipc::{Client, DaemonState};
+use scurry_ctl::ipc::{ack_message, Client, DaemonState};
 use scurry_ctl::transport::Dongle;
 use scurry_proto::{kind, SlotStatus};
+
+/// How long one poll waits for the dongle before giving up on that round.
+const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenInfo {
@@ -69,13 +72,19 @@ pub fn spawn_poller(
     state: Arc<DaemonState>,
     out: Arc<Mutex<Snapshot>>,
 ) {
-    std::thread::spawn(move || loop {
-        let focus = state.focus.load(Ordering::Relaxed);
-        let mut screens = Vec::new();
-        let mut slots = Vec::new();
+    std::thread::spawn(move || {
+        // Carried across polls. A poll that goes unanswered is not news that
+        // the layout changed, and publishing an empty list for it emptied the
+        // menu until the next round -- the screens flickered in and out. Only
+        // a real answer replaces what is shown.
+        let mut screens: Vec<ScreenInfo> = Vec::new();
+        let mut slots: Vec<SlotStatus> = Vec::new();
 
-        if let Ok((k, p)) = state.request(&link, kind::GET_CONFIG, &[], kind::CONFIG, Duration::from_secs(2)) {
-            if k == kind::CONFIG {
+        loop {
+            let focus = state.focus.load(Ordering::Relaxed);
+
+            let cfg = state.request(&link, kind::GET_CONFIG, &[], kind::CONFIG, POLL_TIMEOUT);
+            if let Ok((kind::CONFIG, p)) = cfg {
                 if let Ok(cfg) = Config::from_payload(&p) {
                     screens = cfg
                         .screens
@@ -89,23 +98,26 @@ pub fn spawn_poller(
                         .collect();
                 }
             }
-        }
-        if let Ok((k, p)) = state.request(&link, kind::GET_STATUS, &[], kind::STATUS, Duration::from_secs(2)) {
-            if k == kind::STATUS && !p.is_empty() {
-                let count = p[0] as usize;
-                for i in 0..count {
-                    let off = 1 + i * SlotStatus::WIRE_LEN;
-                    if let Some(slot) = p.get(off..).and_then(SlotStatus::decode) {
-                        slots.push(slot);
+
+            let st = state.request(&link, kind::GET_STATUS, &[], kind::STATUS, POLL_TIMEOUT);
+            if let Ok((kind::STATUS, p)) = st {
+                if !p.is_empty() {
+                    let count = p[0] as usize;
+                    slots = Vec::new();
+                    for i in 0..count {
+                        let off = 1 + i * SlotStatus::WIRE_LEN;
+                        if let Some(slot) = p.get(off..).and_then(SlotStatus::decode) {
+                            slots.push(slot);
+                        }
                     }
                 }
             }
-        }
 
-        if let Ok(mut cell) = out.lock() {
-            *cell = Snapshot::Ready { focus, screens, slots };
+            if let Ok(mut cell) = out.lock() {
+                *cell = Snapshot::Ready { focus, screens: screens.clone(), slots: slots.clone() };
+            }
+            std::thread::sleep(Duration::from_secs(2));
         }
-        std::thread::sleep(Duration::from_secs(2));
     });
 }
 
@@ -113,8 +125,14 @@ pub fn spawn_poller(
 pub fn load_config() -> Result<Config> {
     let mut c = Client::connect()?;
     let (k, p) = c.request(kind::GET_CONFIG, &[])?;
+    // An ACK here is a refusal, or the app saying nothing answered in time.
+    // Reporting the raw kind ("unexpected reply 0x15") told the user nothing
+    // about which of those it was.
+    if k == kind::ACK {
+        anyhow::bail!("could not read the layout: {}", ack_message(&p));
+    }
     if k != kind::CONFIG {
-        anyhow::bail!("unexpected reply {k:#04x} to a config request");
+        anyhow::bail!("the app answered a layout request with a {k:#04x} message");
     }
     Config::from_payload(&p)
 }
@@ -125,12 +143,12 @@ pub fn save_config(cfg: &Config) -> Result<()> {
     let mut c = Client::connect()?;
     let (k, p) = c.request(kind::SET_CONFIG, &payload)?;
     if k != kind::ACK {
-        anyhow::bail!("unexpected reply {k:#04x} to a config write");
+        anyhow::bail!("the app answered a layout write with a {k:#04x} message");
     }
     match p.first().copied().unwrap_or(scurry_proto::ack::BAD_REQUEST) {
         scurry_proto::ack::OK => Ok(()),
         scurry_proto::ack::INVALID_LAYOUT => anyhow::bail!("the dongle rejected the layout"),
         scurry_proto::ack::STORAGE_FAILED => anyhow::bail!("the dongle could not store the layout"),
-        _ => anyhow::bail!("the dongle refused the request"),
+        _ => anyhow::bail!("the layout was not stored: {}", ack_message(&p)),
     }
 }
