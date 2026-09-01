@@ -838,6 +838,65 @@ mod tests {
         assert!(!w.is_active(&[0u8; 6]));
     }
 
+    /// The wire format has a prose description, and prose rots.
+    ///
+    /// It rotted badly enough once to document a node id where the flags byte
+    /// is, and no length field at all -- anyone implementing from it would have
+    /// produced frames the dongle rejects. This reads the module rather than a
+    /// list written out by hand, so a kind added to the code and forgotten in
+    /// the document fails here rather than a year later.
+    #[test]
+    fn every_message_kind_is_documented() {
+        const SRC: &str = include_str!("lib.rs");
+        const DOC: &str = include_str!("../../../doc/protocol.md");
+
+        let body = SRC
+            .split("pub mod kind {")
+            .nth(1)
+            .expect("the kind module moved")
+            .split("\n}")
+            .next()
+            .unwrap();
+
+        let mut found = 0;
+        for line in body.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const ") else {
+                continue;
+            };
+            let (name, rest) = rest.split_once(':').expect("malformed constant");
+            let value = rest
+                .split('=')
+                .nth(1)
+                .expect("malformed constant")
+                .trim()
+                .trim_end_matches(';');
+            assert!(
+                DOC.contains(&format!("`{value}` | `{name}`")),
+                "doc/protocol.md does not document {name} = {value}"
+            );
+            found += 1;
+        }
+        assert!(
+            found >= 14,
+            "parsed only {found} kinds out of the module; the parser has drifted"
+        );
+    }
+
+    /// The header is described byte by byte, so its shape must match too.
+    #[test]
+    fn the_documented_header_is_the_real_one() {
+        const DOC: &str = include_str!("../../../doc/protocol.md");
+        let claims = [
+            format!("magic {MAGIC:#04x}"),
+            "4..6    seq (u16)".to_string(),
+            "6..8    payload length (u16)".to_string(),
+        ];
+        for claim in &claims {
+            assert!(DOC.contains(claim), "doc/protocol.md no longer says {claim:?}");
+        }
+        assert_eq!(HEADER_LEN, 8, "the documented header is 8 bytes");
+    }
+
     #[test]
     fn control_kinds_do_not_collide_with_hot_path() {
         // The split at 0x10 is load-bearing: a reader tells the classes apart
