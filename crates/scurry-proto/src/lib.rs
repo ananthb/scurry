@@ -119,6 +119,24 @@ pub mod kind {
     pub const STATUS: u8 = 0x14;
     /// Dongle -> controller: result of a request.
     pub const ACK: u8 = 0x15;
+
+    /// Controller -> dongle: report the wireless control link's state.
+    pub const GET_WIRELESS: u8 = 0x16;
+    /// Dongle -> controller: see [`super::WirelessState`].
+    pub const WIRELESS: u8 = 0x17;
+    /// Controller -> dongle: open or close the pairing window, or forget the
+    /// controller. Refused when it arrives over the wireless link itself --
+    /// authorising a new controller is exactly the power an attacker would
+    /// want, so it takes physical access.
+    pub const SET_WIRELESS: u8 = 0x18;
+}
+
+/// Operations carried by [`kind::SET_WIRELESS`].
+pub mod wireless_op {
+    /// Forget the pinned controller and close any window.
+    pub const FORGET: u8 = 0;
+    /// Open the pairing window; second byte is how many seconds.
+    pub const PAIR: u8 = 1;
 }
 
 /// Result codes carried by [`kind::ACK`].
@@ -468,6 +486,47 @@ impl SlotStatus {
     }
 }
 
+/// The wireless control link's state, as it appears inside a
+/// [`kind::WIRELESS`] payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WirelessState {
+    /// A controller is connected and subscribed right now.
+    pub ready: bool,
+    /// A controller has been authorised, whether or not it is here.
+    pub pinned: bool,
+    /// Its address; all zero when nothing is pinned.
+    pub bda: [u8; 6],
+    /// Seconds left in the pairing window, 0 when closed.
+    pub window_secs: u8,
+}
+
+impl WirelessState {
+    pub const WIRE_LEN: usize = 9;
+
+    pub fn encode(&self) -> [u8; Self::WIRE_LEN] {
+        let mut b = [0u8; Self::WIRE_LEN];
+        b[0] = u8::from(self.ready);
+        b[1] = u8::from(self.pinned);
+        b[2..8].copy_from_slice(&self.bda);
+        b[8] = self.window_secs;
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let mut bda = [0u8; 6];
+        bda.copy_from_slice(&b[2..8]);
+        Some(Self {
+            ready: b[0] != 0,
+            pinned: b[1] != 0,
+            bda,
+            window_secs: b[8],
+        })
+    }
+}
+
 /// A parsed message header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -661,6 +720,17 @@ mod tests {
     }
 
     #[test]
+    fn wireless_state_roundtrips() {
+        let w = WirelessState {
+            ready: true,
+            pinned: true,
+            bda: [0x84, 0x2f, 0x57, 0x29, 0x63, 0x64],
+            window_secs: 42,
+        };
+        assert_eq!(WirelessState::decode(&w.encode()).unwrap(), w);
+    }
+
+    #[test]
     fn control_kinds_do_not_collide_with_hot_path() {
         // The split at 0x10 is load-bearing: a reader tells the classes apart
         // by magnitude, so an overlap would route a config message into the
@@ -671,6 +741,7 @@ mod tests {
         for k in [
             kind::GET_CONFIG, kind::CONFIG, kind::SET_CONFIG,
             kind::GET_STATUS, kind::STATUS, kind::ACK,
+            kind::GET_WIRELESS, kind::WIRELESS, kind::SET_WIRELESS,
         ] {
             assert!(k >= 0x10, "control kind {k:#x} must be 0x10 or above");
         }

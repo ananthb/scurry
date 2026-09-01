@@ -297,6 +297,7 @@ fn handle(stream: &UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonState)
             let want = match h.kind {
                 kind::GET_CONFIG => kind::CONFIG,
                 kind::GET_STATUS => kind::STATUS,
+                kind::GET_WIRELESS => kind::WIRELESS,
                 kind::PING => kind::PONG,
                 _ => kind::ACK,
             };

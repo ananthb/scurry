@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use scurry_ctl::config::Config;
 use scurry_ctl::ipc::{ack_message, Client};
 use scurry_ctl::transport::{Dongle, Message};
-use scurry_proto::{ack, kind, SlotStatus};
+use scurry_proto::{ack, kind, wireless_op, SlotStatus, WirelessState};
 
 fn usage() -> ! {
     eprintln!(
@@ -23,18 +23,39 @@ commands:
   set-config <file>   store a TOML layout on the dongle
   ping                check the link
   test-move           drive synthetic motion, printing everything the dongle says
+  wireless            show the state of the wireless control link
+  pair [seconds]      open the pairing window so a controller can be authorised
+  forget-controller   revoke the authorised wireless controller
+
+options:
+  --wireless          reach the dongle over BLE instead of the cable
 
 All configuration lives on the dongle. Nothing is stored locally, so a layout
 survives moving to another controller machine.
 
 Commands reach the dongle through the running app when there is one, since it
-holds the serial port exclusively, and open the port directly otherwise."
+holds the serial port exclusively, and open the port directly otherwise.
+
+The wireless link is experimental. The cable always works, is the fallback, and
+is the only way to authorise a controller -- `pair` is refused over the air.
+Pressing the dongle's button three times opens the same window."
     );
     std::process::exit(2)
 }
 
+/// Set by `--wireless`: skip the cable and go over the air.
+static WIRELESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn wireless_requested() -> bool {
+    WIRELESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = args.iter().position(|a| a == "--wireless") {
+        args.remove(i);
+        WIRELESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     match args.first().map(String::as_str).unwrap_or_else(|| usage()) {
         "run" => run(),
         "probe" => probe(),
@@ -43,6 +64,9 @@ fn main() -> Result<()> {
         "set-config" => set_config(args.get(1).map(String::as_str).unwrap_or_else(|| usage())),
         "ping" => ping(),
         "test-move" => test_move(),
+        "wireless" => wireless(),
+        "pair" => pair(args.get(1).map(String::as_str)),
+        "forget-controller" => forget_controller(),
         _ => usage(),
     }
 }
@@ -58,14 +82,36 @@ enum Link {
     Serial(Dongle),
 }
 
+/// How long to scan before giving up on finding a dongle over the air.
+const SCAN_FOR: Duration = Duration::from_secs(8);
+
 fn open_link() -> Result<Link> {
+    if wireless_requested() {
+        eprintln!("scanning for a dongle over BLE...");
+        let d = Dongle::open_wireless(SCAN_FOR)?;
+        eprintln!("dongle: {}", d.describe());
+        return Ok(Link::Serial(d));
+    }
     if let Ok(client) = Client::connect() {
         eprintln!("via the running app");
         return Ok(Link::Socket(client));
     }
-    let path = Dongle::autodetect()?;
-    eprintln!("dongle: {path}");
-    Ok(Link::Serial(Dongle::open(&path)?))
+    // The cable first: it is faster to open by two orders of magnitude, and it
+    // is the path that always works. Wireless is the fallback, not the default,
+    // so a dongle sitting on a desk with a cable in it behaves as it always did.
+    match Dongle::autodetect() {
+        Ok(path) => {
+            eprintln!("dongle: {path}");
+            Ok(Link::Serial(Dongle::open(&path)?))
+        }
+        Err(cable) => {
+            eprintln!("no cable ({cable}); scanning for a dongle over BLE...");
+            let d = Dongle::open_wireless(SCAN_FOR)
+                .map_err(|air| anyhow::anyhow!("{air}"))?;
+            eprintln!("dongle: {}", d.describe());
+            Ok(Link::Serial(d))
+        }
+    }
 }
 
 impl Link {
@@ -254,5 +300,76 @@ fn set_config(path: &str) -> Result<()> {
         bail!("the layout was not stored: {}", ack_message(&msg.payload));
     }
     println!("stored {} screens on the dongle", cfg.screens.len());
+    Ok(())
+}
+
+fn format_bda(bda: [u8; 6]) -> String {
+    bda.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+/// Show whether a controller is authorised, and whether one is here now.
+fn wireless() -> Result<()> {
+    let msg = open_link()?.request(kind::GET_WIRELESS, &[], kind::WIRELESS)?;
+    let w = WirelessState::decode(&msg.payload)
+        .context("the dongle sent a wireless state it could not have meant")?;
+
+    println!("controller:  {}", if w.pinned { format_bda(w.bda) } else { "none authorised".into() });
+    println!("connected:   {}", if w.ready { "yes" } else { "no" });
+    if w.window_secs > 0 {
+        println!("pairing:     open, {}s left", w.window_secs);
+    } else {
+        println!("pairing:     closed");
+    }
+    if !w.pinned {
+        println!();
+        println!("Press the dongle's button three times, or run `scurry-ctl pair`,");
+        println!("then start the controller with --wireless while the window is open.");
+    }
+    Ok(())
+}
+
+/// Open the pairing window.
+///
+/// Refused by the dongle when it arrives over the air, which is the point:
+/// authorising a controller that can type on every machine here should take
+/// physical access, and over the cable it does. The button is the other way in,
+/// and the one that works when the dongle is nowhere near this machine.
+fn pair(seconds: Option<&str>) -> Result<()> {
+    let secs: u8 = match seconds {
+        Some(s) => s.parse().context("pair takes a number of seconds")?,
+        None => 60,
+    };
+    if secs == 0 {
+        bail!("a zero-second window would close before anything could use it");
+    }
+    if wireless_requested() {
+        bail!("the dongle refuses to change pairing over the wireless link. \n\
+               Use the cable, or press the dongle's button three times.");
+    }
+    let msg = open_link()?.request(
+        kind::SET_WIRELESS,
+        &[wireless_op::PAIR, secs],
+        kind::ACK,
+    )?;
+    let code = msg.payload.first().copied().unwrap_or(ack::BAD_REQUEST);
+    if code != ack::OK {
+        bail!("the dongle refused to open the window: {}", ack_message(&msg.payload));
+    }
+    println!("pairing window open for {secs}s.");
+    println!("Now run: scurry-ctl --wireless ping");
+    Ok(())
+}
+
+/// Revoke the authorised controller.
+fn forget_controller() -> Result<()> {
+    if wireless_requested() {
+        bail!("this has to go over the cable, or a controller could keep itself authorised");
+    }
+    let msg = open_link()?.request(kind::SET_WIRELESS, &[wireless_op::FORGET], kind::ACK)?;
+    let code = msg.payload.first().copied().unwrap_or(ack::BAD_REQUEST);
+    if code != ack::OK {
+        bail!("the dongle refused: {}", ack_message(&msg.payload));
+    }
+    println!("the wireless controller is no longer authorised");
     Ok(())
 }
