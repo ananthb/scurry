@@ -29,9 +29,40 @@ use crate::status::{spawn_poller, Snapshot};
 /// How often the menu is rebuilt, and how often a missing dongle is retried.
 const REFRESH: Duration = Duration::from_secs(2);
 
+/// Ceiling on the wait between capture retries once one has failed for a reason
+/// other than missing permission.
+#[cfg(target_os = "macos")]
+const MAX_CAPTURE_BACKOFF: Duration = Duration::from_secs(60);
+
 const ID_SETTINGS: &str = "settings";
 const ID_LOGIN: &str = "login";
 const ID_QUIT: &str = "quit";
+
+/// What a poll should do about the dongle link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attach {
+    /// A working link is held. Leave it alone.
+    Hold,
+    /// Nothing is attached. Look for a dongle.
+    Open,
+    /// A link is held but the device behind it is gone. Reopen the port into
+    /// the handle every consumer already holds.
+    Reopen,
+}
+
+/// Decide from the only two facts that matter, so the rule can be tested
+/// without a dongle to unplug.
+///
+/// The case this exists for: after an unplug the app held a live `Arc` around a
+/// dead fd, so "is something attached?" answered yes forever and the port was
+/// never reopened. Attachment alone is not health.
+fn decide_attach(attached: bool, link_failed: bool) -> Attach {
+    match (attached, link_failed) {
+        (false, _) => Attach::Open,
+        (true, true) => Attach::Reopen,
+        (true, false) => Attach::Hold,
+    }
+}
 
 fn icon() -> Result<tray_icon::Icon> {
     const PNG: &[u8] = include_bytes!("../../../assets/tray.png");
@@ -64,6 +95,18 @@ struct App {
     /// something a person would see has actually changed.
     rendered: Option<(Snapshot, bool)>,
     next_refresh: Instant,
+    /// Set when the reader reports the device gone, and cleared only once the
+    /// port has actually been reopened. Sticky, because the user may take a
+    /// while to plug the dongle back in and there is nothing to do until they
+    /// do.
+    link_failed: bool,
+    /// When capture may next be attempted. Retrying on every poll meant
+    /// `CGEventTapCreate` was called every two seconds for as long as the user
+    /// took to grant Accessibility.
+    #[cfg(target_os = "macos")]
+    next_capture_try: Instant,
+    #[cfg(target_os = "macos")]
+    capture_backoff: Duration,
 }
 
 impl App {
@@ -78,47 +121,138 @@ impl App {
             snapshot: Arc::new(Mutex::new(Snapshot::NoDongle)),
             rendered: None,
             next_refresh: Instant::now(),
+            link_failed: false,
+            #[cfg(target_os = "macos")]
+            next_capture_try: Instant::now(),
+            #[cfg(target_os = "macos")]
+            capture_backoff: REFRESH,
+        }
+    }
+
+    /// Start capture, if there is a dongle to capture for and it is not already
+    /// running.
+    ///
+    /// Capture is not required for the app to be useful -- settings and status
+    /// work without it -- so a failure here is never fatal. Giving up on it
+    /// used to leave the app holding the serial port while serving nothing:
+    /// capture dead, no control socket, and the CLI locked out of a port it
+    /// could otherwise have used.
+    #[cfg(target_os = "macos")]
+    fn try_start_capture(&mut self) {
+        let Some(link) = &self.link else { return };
+        if self._tap.is_some() || Instant::now() < self.next_capture_try {
+            return;
+        }
+        // Ask macOS first. Until permission is granted `CGEventTapCreate` can
+        // only fail, and calling it every two seconds for however long the user
+        // takes to find the switch is pure noise; the trust check answers the
+        // same question without touching the event system.
+        if !scurry_ctl::capture::accessibility_trusted(false) {
+            self.next_capture_try = Instant::now() + REFRESH;
+            return;
+        }
+        match scurry_ctl::capture::install(Arc::clone(link), Arc::clone(&self.state)) {
+            Ok(tap) => {
+                eprintln!("capture started");
+                self._tap = Some(tap);
+                self.capture_backoff = REFRESH;
+            }
+            Err(e) => {
+                // Trusted and still failing means something other than
+                // permission, which is unlikely to clear up within two seconds.
+                // Back off, so a persistent failure does not repeat the same
+                // complaint forever.
+                eprintln!(
+                    "capture unavailable, retrying in {:?}: {e}",
+                    self.capture_backoff
+                );
+                self.next_capture_try = Instant::now() + self.capture_backoff;
+                self.capture_backoff = (self.capture_backoff * 2).min(MAX_CAPTURE_BACKOFF);
+            }
         }
     }
 
     /// Try to attach to a dongle, and start capture once one is there.
     fn try_attach(&mut self) {
-        // Already attached, but capture never started -- retry it, so granting
-        // Accessibility takes effect on the next poll rather than needing the
-        // app to be restarted.
-        #[cfg(target_os = "macos")]
-        if self.link.is_some() && self._tap.is_none() {
-            if let Some(link) = &self.link {
-                if let Ok(tap) =
-                    scurry_ctl::capture::install(Arc::clone(link), Arc::clone(&self.state))
-                {
-                    eprintln!("capture started");
-                    self._tap = Some(tap);
-                }
+        // Latched, not level-triggered, and taken on every poll so a failure
+        // reported while nothing was attached cannot linger and trigger a
+        // pointless reopen later.
+        self.link_failed |= scurry_ctl::capture::take_link_failure();
+
+        match decide_attach(self.link.is_some(), self.link_failed) {
+            Attach::Hold => {}
+            Attach::Reopen => {
+                self.reopen();
+                return;
+            }
+            Attach::Open => {
+                self.open();
+                return;
             }
         }
-        if self.link.is_some() {
+
+        // Attached and healthy. Capture may still be waiting on Accessibility,
+        // so keep trying: granting it takes effect on a later poll rather than
+        // needing the app to be restarted.
+        #[cfg(target_os = "macos")]
+        self.try_start_capture();
+    }
+
+    /// Reopen the serial port into the handle everything already holds.
+    ///
+    /// The control socket thread, the status poller and the event tap's
+    /// callback each captured a clone of the `Arc` when they started, and none
+    /// of them can be handed a replacement. So a replug swaps the `Dongle`
+    /// *inside* the mutex rather than the `Arc` around it, and every one of them
+    /// picks the new device up on its next operation -- no second socket server,
+    /// no second poller, no second reader, and no tap to tear down and rebuild.
+    ///
+    /// Quiet when there is nothing to open: a dongle that is still unplugged is
+    /// an ordinary state, and this runs every two seconds.
+    fn reopen(&mut self) {
+        let Some(link) = &self.link else { return };
+        let Ok(path) = Dongle::autodetect() else {
             return;
+        };
+        let Ok(fresh) = Dongle::open(&path) else {
+            return;
+        };
+        let Ok(mut guard) = link.lock() else {
+            eprintln!("dongle handle poisoned; cannot reattach");
+            return;
+        };
+        // Assigning drops the dead handle, closing its fd.
+        *guard = fresh;
+        drop(guard);
+        self.link_failed = false;
+        eprintln!("dongle: {path} (reattached)");
+
+        // The old reader exited when the device vanished, which is what set the
+        // failure flag in the first place. Start one on the new device.
+        let link = Arc::clone(link);
+        if let Err(e) = scurry_ctl::capture::watch(&link, &self.state) {
+            eprintln!("could not read from the reattached dongle: {e}");
         }
-        let Ok(path) = Dongle::autodetect() else { return };
-        let Ok(dongle) = Dongle::open(&path) else { return };
+    }
+
+    /// Open a dongle for the first time and start everything that hangs off it.
+    fn open(&mut self) {
+        let Ok(path) = Dongle::autodetect() else {
+            return;
+        };
+        let Ok(dongle) = Dongle::open(&path) else {
+            return;
+        };
         eprintln!("dongle: {path}");
         let link = Arc::new(Mutex::new(dongle));
 
-        #[cfg(target_os = "macos")]
-        {
-            match scurry_ctl::capture::install(Arc::clone(&link), Arc::clone(&self.state)) {
-                Ok(tap) => self._tap = Some(tap),
-                Err(e) => {
-                    // Almost always missing Accessibility permission. Do NOT
-                    // give up here: returning early left the app holding the
-                    // serial port while serving nothing -- capture dead, no
-                    // control socket, and the CLI locked out of a port it could
-                    // otherwise have used. Carry on without capture; settings
-                    // and status still work, and the next poll retries.
-                    eprintln!("capture unavailable, continuing without it: {e}");
-                }
-            }
+        // Started here rather than left to `capture::install`, because the
+        // control socket and the status poller both need their replies handed
+        // back by this thread. Deferring it to capture would leave the settings
+        // window and the CLI timing out for as long as macOS withheld
+        // Accessibility.
+        if let Err(e) = scurry_ctl::capture::watch(&link, &self.state) {
+            eprintln!("could not read from the dongle: {e}");
         }
 
         // The settings window is a separate process and cannot open the port,
@@ -134,8 +268,17 @@ impl App {
             self.socket_started = true;
         }
 
-        spawn_poller(Arc::clone(&link), Arc::clone(&self.state), Arc::clone(&self.snapshot));
+        spawn_poller(
+            Arc::clone(&link),
+            Arc::clone(&self.state),
+            Arc::clone(&self.snapshot),
+        );
         self.link = Some(link);
+
+        // Now that there is a link to capture for, and without waiting for the
+        // next poll.
+        #[cfg(target_os = "macos")]
+        self.try_start_capture();
     }
 
     fn build_menu(&self, snap: &Snapshot) -> Menu {
@@ -147,9 +290,17 @@ impl App {
             }
             #[cfg(target_os = "macos")]
             Snapshot::NeedsPermission => {
-                let _ = menu.append(&MenuItem::new("Waiting for Accessibility access", false, None));
+                let _ = menu.append(&MenuItem::new(
+                    "Waiting for Accessibility access",
+                    false,
+                    None,
+                ));
             }
-            Snapshot::Ready { focus, screens, slots } => {
+            Snapshot::Ready {
+                focus,
+                screens,
+                slots,
+            } => {
                 let here = *focus == 0;
                 let name = screens
                     .iter()
@@ -157,7 +308,11 @@ impl App {
                     .map(|s| s.name.clone())
                     .unwrap_or_else(|| format!("node {focus}"));
                 let _ = menu.append(&MenuItem::new(
-                    if here { "Pointer here".to_string() } else { format!("Pointer on {name}") },
+                    if here {
+                        "Pointer here".to_string()
+                    } else {
+                        format!("Pointer on {name}")
+                    },
                     false,
                     None,
                 ));
@@ -167,13 +322,19 @@ impl App {
                     for screen in screens {
                         let mark = if screen.node == 0 {
                             "this machine"
-                        } else if slots.iter().any(|s| s.slot + 1 == screen.node && s.connected) {
+                        } else if slots
+                            .iter()
+                            .any(|s| s.slot + 1 == screen.node && s.connected)
+                        {
                             "connected"
                         } else {
                             "offline"
                         };
                         let _ = menu.append(&MenuItem::new(
-                            format!("{}  ·  {}×{}  ·  {mark}", screen.name, screen.width, screen.height),
+                            format!(
+                                "{}  ·  {}×{}  ·  {mark}",
+                                screen.name, screen.width, screen.height
+                            ),
                             false,
                             None,
                         ));
@@ -197,25 +358,41 @@ impl App {
             None,
         ));
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(MenuId::new(ID_QUIT), "Quit scurry", true, None));
+        let _ = menu.append(&MenuItem::with_id(
+            MenuId::new(ID_QUIT),
+            "Quit scurry",
+            true,
+            None,
+        ));
         menu
     }
 
     fn refresh(&mut self) {
         self.try_attach();
 
-        let snap = if self.link.is_none() {
+        // A dead link reads as no dongle. The poller cannot tell the difference
+        // on its own: its requests to a vanished device simply time out, and it
+        // would go on publishing a `Ready` with an empty screen list, so the
+        // menu would claim the pointer was here on a machine that is no longer
+        // connected to anything.
+        let snap = if self.link.is_none() || self.link_failed {
             Snapshot::NoDongle
         } else {
             #[cfg(target_os = "macos")]
             if !scurry_ctl::capture::accessibility_trusted(false) {
                 Snapshot::NeedsPermission
             } else {
-                self.snapshot.lock().map(|s| s.clone()).unwrap_or(Snapshot::NoDongle)
+                self.snapshot
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or(Snapshot::NoDongle)
             }
             #[cfg(not(target_os = "macos"))]
             {
-                self.snapshot.lock().map(|s| s.clone()).unwrap_or(Snapshot::NoDongle)
+                self.snapshot
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or(Snapshot::NoDongle)
             }
         };
 
@@ -323,4 +500,36 @@ pub fn run() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::new())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_attached_looks_for_a_dongle() {
+        assert_eq!(decide_attach(false, false), Attach::Open);
+    }
+
+    #[test]
+    fn a_healthy_link_is_left_alone() {
+        // Reopening a working port on every poll would drop the fd the control
+        // socket and the tap are using, twice a second.
+        assert_eq!(decide_attach(true, false), Attach::Hold);
+    }
+
+    #[test]
+    fn a_dead_link_is_reopened_rather_than_held() {
+        // The bug: unplug and replug left a live Arc around a dead fd, the
+        // "already attached" check passed forever, and the app never held a
+        // descriptor on the device again.
+        assert_eq!(decide_attach(true, true), Attach::Reopen);
+    }
+
+    #[test]
+    fn a_failure_without_a_link_still_opens_from_scratch() {
+        // A failure latched from a link that was never replaced must not stop
+        // the ordinary first-attach path from running.
+        assert_eq!(decide_attach(false, true), Attach::Open);
+    }
 }
