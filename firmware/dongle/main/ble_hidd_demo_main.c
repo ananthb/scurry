@@ -28,6 +28,7 @@
 #include "hid_dev.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "scurry_ffi.h"
 
@@ -352,6 +353,12 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
 static uint16_t scurry_tx_seq = 0;
 static uint8_t  scurry_focus_node = 0;
+static int64_t  scurry_focus_sent_us = 0;
+
+/* How long the current focus may go unrepeated while the pointer is moving.
+   A FOCUS frame is 9 bytes against a ~125Hz 16-byte pointer stream, so at 2Hz
+   the repeat costs well under a thousandth of the link. */
+#define SCURRY_FOCUS_REPEAT_US 500000
 
 static bool     scurry_seq_seen = false;
 static uint16_t scurry_seq_last = 0;
@@ -414,16 +421,40 @@ static void scurry_send_ack(uint8_t code)
     scurry_send(SCURRY_KIND_ACK, &code, 1);
 }
 
-/* Tell the controller where the pointer went. Without this it cannot know
-   whether to swallow local input, because it no longer owns the layout. */
+/* Tell the controller where the pointer is. Without this it cannot know whether
+ * to swallow local input, because it no longer owns the layout.
+ *
+ * Repeated while the pointer keeps moving, not only when it crosses. FOCUS is
+ * the only thing carrying that decision, so when it was edge-triggered a single
+ * frame lost, truncated or mis-framed on the USB stream stranded the
+ * controller's flag forever: the Mac kept moving its own cursor and clicking
+ * while the dongle drove the same input into a target, and nothing ever
+ * repaired it. Repeating makes focus absolute state, the same rule the button
+ * bitmask already follows -- the next frame fixes what the last one lost.
+ *
+ * Driven off the clock rather than a message count because the pointer stream
+ * is bursty: a count fires several times a second during a flick and not at all
+ * while the hand is still. The clock is read here, on the reader task, rather
+ * than from a FreeRTOS timer, so scurry_tx_seq and the USB writes stay
+ * single-threaded -- as does the layout the caller just advanced.
+ *
+ * The log line stays edge-triggered. It shares the pipe with the protocol
+ * stream in the other direction, and 2Hz of it forever is noise the controller
+ * would have to parse around.
+ */
 static void scurry_announce_focus(uint8_t node)
 {
-    if (node == scurry_focus_node) {
+    int64_t now = esp_timer_get_time();
+    bool changed = node != scurry_focus_node;
+    if (!changed && now - scurry_focus_sent_us < SCURRY_FOCUS_REPEAT_US) {
         return;
     }
     scurry_focus_node = node;
+    scurry_focus_sent_us = now;
     scurry_send(SCURRY_KIND_FOCUS, &node, 1);
-    ESP_LOGI(HID_DEMO_TAG, "scurry: focus -> node %d", node);
+    if (changed) {
+        ESP_LOGI(HID_DEMO_TAG, "scurry: focus -> node %d", node);
+    }
 }
 
 static esp_err_t scurry_nvs_save(const uint8_t *buf, size_t len)
@@ -532,7 +563,6 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
             uint8_t none[6] = {0};
             esp_hidd_send_keyboard_value((uint16_t)from_conn, 0, none, 0);
         }
-        scurry_announce_focus(route.to);
 
         /* Re-anchor. With relative motion the dongle is dead reckoning, and its
            model drifts: the target applies its own pointer acceleration to our
@@ -557,6 +587,12 @@ static void scurry_handle_mouse(const uint8_t *p, uint16_t len)
                      route.to, route.edge);
         }
     }
+
+    /* Unconditional, and before the node 0 return: a lost FOCUS is as damaging
+       coming home as it is leaving. Losing "node 0" leaves the controller
+       swallowing input that the dongle no longer transmits, so the pointer
+       vanishes entirely. */
+    scurry_announce_focus(route.to);
 
     /* Node 0 is the controller's own screen. Sending anything here would mean
        two pointers moving at once, which must never happen. */
@@ -597,6 +633,11 @@ static void scurry_handle_key(const uint8_t *p, uint16_t len)
     /* Keyboard follows the pointer: there is one focus, and typing belongs to
        whichever machine the user is looking at. */
     uint8_t node = scurry_focus_node;
+    /* Typing without moving the mouse is a real way to spend a minute, and a
+       stale focus flag lands those keystrokes on both machines just as it does
+       clicks. Refresh here too, or the repair only ever arrives once the hand
+       goes back to the mouse. */
+    scurry_announce_focus(node);
     if (node == 0) {
         return; /* the controller's own screen handles its own keys */
     }
