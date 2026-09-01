@@ -108,6 +108,28 @@ impl Screen {
         ((clamped * u16::MAX as i64) / (span - 1) as i64) as u16
     }
 
+    /// Which edge of this screen a point sits closest to.
+    ///
+    /// Used when the pointer is pulled back onto the local screen from a
+    /// machine that went away: the side it lands on is the side that machine
+    /// was on.
+    fn nearest_edge(&self, x: i32, y: i32) -> Edge {
+        let left = x - self.x;
+        let right = (self.x + self.width - 1) - x;
+        let top = y - self.y;
+        let bottom = (self.y + self.height - 1) - y;
+        let min = left.min(right).min(top).min(bottom);
+        if min == left {
+            Edge::Left
+        } else if min == right {
+            Edge::Right
+        } else if min == top {
+            Edge::Top
+        } else {
+            Edge::Bottom
+        }
+    }
+
     /// Inverse of [`Screen::ratio_along`]: a point on `edge` at `ratio`.
     fn point_on(&self, edge: Edge, ratio: u16) -> (i32, i32) {
         let along = |span: i32| -> i32 {
@@ -261,6 +283,41 @@ impl Layout {
 
     pub fn position(&self) -> (i32, i32) {
         (self.x, self.y)
+    }
+
+    /// Bring the pointer home if it is standing on a screen that can no longer
+    /// receive input.
+    ///
+    /// [`Layout::advance`] checks availability of the screen being *entered*,
+    /// which is not enough: the pointer can already be on a machine when that
+    /// machine goes away. Motion within it then takes the fast path, stays put,
+    /// and every report is addressed to a connection that no longer exists.
+    /// Input goes nowhere, with nothing on screen to say why, until the user
+    /// happens to push back towards their own machine.
+    ///
+    /// It lands at the point on the local screen nearest to where it was, not
+    /// at the centre. The controller has its own cursor parked against the edge
+    /// the pointer left by, so the nearest point is usually exactly where that
+    /// cursor already is -- and centring would put the two ends a screen-width
+    /// apart with nothing to re-anchor them until the next crossing.
+    pub fn home_if_stranded(&mut self) -> Option<Motion> {
+        let from = self.active().node;
+        if self.is_available(from) {
+            return None;
+        }
+        let local = self.screens[..self.count]
+            .iter()
+            .position(|s| s.node == Screen::LOCAL)?;
+
+        let dest = self.screens[local];
+        let (px, py) = dest.clamp(self.x, self.y);
+        let edge = dest.nearest_edge(px, py);
+        let ratio = dest.ratio_along(edge, px, py);
+
+        self.current = local;
+        self.x = px;
+        self.y = py;
+        Some(Motion::Crossed { from, to: Screen::LOCAL, edge, ratio, x: px, y: py })
     }
 
     /// Apply relative motion and report whether the pointer changed screens.
@@ -451,6 +508,56 @@ mod tests {
         // And crosses again once that machine connects.
         l.set_available(1 << 1);
         assert!(matches!(l.advance(600, 0), Motion::Crossed { to: 1, .. }));
+    }
+
+    #[test]
+    fn a_screen_going_away_under_the_pointer_brings_it_home() {
+        // The bug: advance() only checks availability of the screen being
+        // entered, so a machine disconnecting while the pointer was on it left
+        // the pointer parked there. Every report went to a dead connection and
+        // input died silently.
+        let mut l = pair();
+        l.advance(600, 0);
+        assert!(!l.is_local());
+
+        l.set_available(0); // the neighbour dropped off
+        match l.home_if_stranded() {
+            Some(Motion::Crossed { from, to, .. }) => assert_eq!((from, to), (1, 0)),
+            other => panic!("expected the pointer to come home, got {other:?}"),
+        }
+        assert!(l.is_local());
+    }
+
+    #[test]
+    fn coming_home_lands_beside_the_screen_that_went_away() {
+        // Not the centre. The controller's own cursor is parked against the
+        // edge the pointer left by, and centring would put the two ends a
+        // screen-width apart with nothing to re-anchor them.
+        let mut l = pair();
+        l.advance(600, 0); // onto the neighbour, which is to the right
+        l.set_available(0);
+        l.home_if_stranded().unwrap();
+        let (x, _) = l.position();
+        assert_eq!(x, 999, "must land against the right edge of the local screen");
+    }
+
+    #[test]
+    fn a_healthy_screen_is_left_alone() {
+        // It runs on every poll, so it must be free and silent in the normal
+        // case.
+        let mut l = pair();
+        l.advance(600, 0);
+        assert!(l.home_if_stranded().is_none());
+        assert!(!l.is_local(), "must not drag the pointer off a working screen");
+    }
+
+    #[test]
+    fn being_home_already_is_never_stranded() {
+        // Node 0 is always available, so this must terminate rather than
+        // repeatedly trying to rescue itself.
+        let mut l = pair();
+        l.set_available(0);
+        assert!(l.home_if_stranded().is_none());
     }
 
     #[test]

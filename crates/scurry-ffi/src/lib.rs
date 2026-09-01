@@ -6,7 +6,7 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use scurry_layout::{Layout, Motion, Screen};
 use scurry_proto::{mouse_flag, InputProfile, ScreenWire, MAX_SCREENS, SCREEN_WIRE_LEN};
@@ -46,9 +46,12 @@ fn normalise(offset: i32, span: i32) -> u16 {
     ((clamped * 32767) / (span - 1) as i64) as u16
 }
 
-/// The single layout. The firmware is single-threaded over this: only the
-/// reader task touches it, so a plain static is sufficient and an allocator
-/// would buy nothing.
+/// The single layout.
+///
+/// Only one task mutates this -- the one that handles input. That was not quite
+/// true before: availability was published straight from the Bluetooth task on
+/// every connect and disconnect, racing the task that was reading and writing
+/// the pointer position. It is deferred now; see [`PENDING_MASK`].
 static mut LAYOUT: Option<Layout> = None;
 static CONFIGURED: AtomicBool = AtomicBool::new(false);
 
@@ -274,21 +277,85 @@ pub unsafe extern "C" fn scurry_layout_node_for_address(bda: *const u8) -> i32 {
     -1
 }
 
+/// The most recent availability mask, waiting to be applied.
+///
+/// Deferred rather than applied here because this is called from the Bluetooth
+/// task, on connect and disconnect, while the layout is being read and written
+/// by the task that handles input. Touching it from both is a data race on a
+/// static holding the pointer position. Storing the mask is not.
+static PENDING_MASK: AtomicU32 = AtomicU32::new(0);
+static HAS_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Declare which nodes can currently receive input, as a bitmask where bit N
 /// means node N. Node 0 is always available regardless.
 ///
 /// Without this the pointer crosses onto machines that are not connected, which
 /// presents as the pointer sticking to a screen edge and going dead.
 ///
+/// Takes effect on the next [`scurry_layout_settle`].
+///
 /// # Safety
-/// Safe to call at any time; takes effect on the next advance.
+/// Safe to call from any task.
 #[no_mangle]
 pub extern "C" fn scurry_layout_set_available(mask: u32) {
-    unsafe {
-        if let Some(l) = &mut *core::ptr::addr_of_mut!(LAYOUT) {
-            l.set_available(mask);
-        }
+    PENDING_MASK.store(mask, Ordering::Relaxed);
+    HAS_PENDING.store(true, Ordering::Release);
+}
+
+/// Apply a pending availability change, and rescue the pointer if it is
+/// standing on a machine that just went away.
+///
+/// Returns 1 when the pointer had to move, with `out` filled in as for
+/// [`scurry_layout_advance`]; 0 when there was nothing to do.
+///
+/// Called from the task that handles input, so everything that mutates the
+/// layout happens on one thread.
+///
+/// # Safety
+/// `out` must point to a writable `ScurryRoute`.
+#[no_mangle]
+pub unsafe extern "C" fn scurry_layout_settle(out: *mut ScurryRoute) -> i32 {
+    if out.is_null() {
+        return -1;
     }
+    let layout = match &mut *core::ptr::addr_of_mut!(LAYOUT) {
+        Some(l) => l,
+        // Nothing to apply it to yet. The mask is left pending rather than
+        // consumed, or the availability known at boot would be dropped on the
+        // floor and the first layout would route to machines that are not there.
+        None => return 0,
+    };
+    // Load and store rather than swap: riscv32imc has no atomic read-modify-
+    // write, so `swap` does not compile for this target at all.
+    //
+    // Clearing before reading the mask is the safe order. A publish landing in
+    // between leaves the flag set, so the next poll applies it again -- one
+    // redundant application, rather than an update dropped and a layout left
+    // routing to a machine that is no longer there.
+    if !HAS_PENDING.load(Ordering::Acquire) {
+        return 0;
+    }
+    HAS_PENDING.store(false, Ordering::Release);
+    layout.set_available(PENDING_MASK.load(Ordering::Relaxed));
+
+    let Some(Motion::Crossed { from, to, edge, ratio, .. }) = layout.home_if_stranded() else {
+        return 0;
+    };
+    let active = layout.active();
+    let (px, py) = layout.position();
+    core::ptr::write(
+        out,
+        ScurryRoute {
+            crossed: 1,
+            from,
+            to,
+            edge: edge_to_wire(edge),
+            ratio,
+            abs_x: normalise(px - active.x, active.width),
+            abs_y: normalise(py - active.y, active.height),
+        },
+    );
+    1
 }
 
 /// True once a layout has been installed. Until then the dongle has nowhere to

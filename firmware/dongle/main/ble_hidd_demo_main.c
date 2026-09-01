@@ -1197,6 +1197,21 @@ void scurry_reader_task(void *pvParameters)
 
     static uint8_t chunk[256];
     while (1) {
+        /* Availability changes are published from the Bluetooth task and
+           applied here, so only one task ever mutates the layout. It also
+           rescues the pointer when the machine it was standing on goes away:
+           without that it stays parked there, every report is addressed to a
+           connection that no longer exists, and input dies with nothing on
+           screen to say why. */
+        scurry_route_t settled;
+        if (scurry_layout_settle(&settled) == 1) {
+            ESP_LOGW(HID_DEMO_TAG, "scurry: node %d went away under the pointer; coming home",
+                     settled.from);
+            /* No release to send: the machine is gone. Its host drops held
+               buttons and keys when the link does. */
+            scurry_announce_focus(settled.to);
+        }
+
         /* pdMS_TO_TICKS, and never less than one tick: the tick is 10ms here,
            so a raw `5 / portTICK_PERIOD_MS` truncates to zero, the read stops
            blocking, and this loop spins at 100% until the task watchdog fires.

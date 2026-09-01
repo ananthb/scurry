@@ -65,6 +65,11 @@ int32_t scurry_layout_node_for_address(const uint8_t *bda);
    that are not connected, which looks like it sticking to an edge and dying. */
 void scurry_layout_set_available(uint32_t mask);
 
+/* Apply a pending availability change and rescue a stranded pointer. Returns 1
+   when the pointer had to move, filling `out` as scurry_layout_advance does.
+   Must be called from the task that handles input. */
+int32_t scurry_layout_settle(scurry_route_t *out);
+
 /* 0 until a layout is installed. Until then there is nowhere to route input. */
 uint8_t scurry_layout_ready(void);
 
