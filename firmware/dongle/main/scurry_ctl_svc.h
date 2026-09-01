@@ -54,11 +54,20 @@ void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda);
  * bond with it. That is acceptable for a mouse. It is not acceptable for a link
  * that can type, so an encrypted connection is necessary but not sufficient:
  * the controller's address must also have been pinned, and pinning only happens
- * inside a window that can only be opened over the cable.
+ * inside a window. The window opens two ways, and both of them mean somebody is
+ * standing at the dongle: a triple press of its button, or a request over the
+ * cable, which is refused if it arrives over the air.
  *
  * Physical access is therefore still what grants control, exactly as it was
- * when the cable was the only path. */
+ * when the cable was the only path.
+ *
+ * On hardware with a display this becomes a real passkey: show six digits and
+ * make the controller prove it can see them. That needs the device's IO
+ * capability raised to DisplayOnly, which is a global security parameter -- so
+ * it has to be raised when the window opens and lowered again when it closes,
+ * or every target would start being asked to type a code at a mouse. */
 void scurry_ctl_svc_open_pairing(uint32_t seconds);
+void scurry_ctl_svc_close_pairing(void);
 bool scurry_ctl_svc_pinned(esp_bd_addr_t out);
 void scurry_ctl_svc_forget(void);
 /* Seconds left in the pairing window, 0 when closed. */

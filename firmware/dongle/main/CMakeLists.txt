@@ -3,6 +3,7 @@ idf_component_register(SRCS "ble_hidd_demo_main.c"
                             "hid_dev.c"
                             "hid_device_le_prf.c"
                             "scurry_ctl_svc.c"
+                            "scurry_button.c"
                     PRIV_REQUIRES bt nvs_flash esp_driver_gpio esp_driver_usb_serial_jtag esp_ringbuf
                     INCLUDE_DIRS ".")
 

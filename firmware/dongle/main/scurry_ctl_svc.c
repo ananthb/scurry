@@ -143,6 +143,14 @@ void scurry_ctl_svc_open_pairing(uint32_t seconds)
              (unsigned)seconds);
 }
 
+void scurry_ctl_svc_close_pairing(void)
+{
+    if (pairing_until_us != 0) {
+        pairing_until_us = 0;
+        ESP_LOGI(TAG, "pairing window closed");
+    }
+}
+
 uint32_t scurry_ctl_svc_pairing_remaining(void)
 {
     if (!pairing_open()) {

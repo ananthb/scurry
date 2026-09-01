@@ -34,6 +34,7 @@
 #include "scurry_ffi.h"
 #include "esp_gatt_common_api.h"
 #include "scurry_ctl_svc.h"
+#include "scurry_button.h"
 
 /**
  * Brief:
@@ -855,6 +856,34 @@ static void scurry_handle_set_config(const uint8_t *p, uint16_t len)
     scurry_send_ack(SCURRY_ACK_OK);
 }
 
+/* Presses that open the pairing window, and how long it stays open.
+ *
+ * Three, not one or two: BOOT is the button people mash by reflex when a flash
+ * goes wrong, and the thing behind it authorises a device that can type on
+ * every machine here. It should take an act nobody performs by accident. */
+#define SCURRY_PAIR_PRESSES 3
+#define SCURRY_PAIR_WINDOW_S 60
+
+/* The button is the whole ceremony on this hardware: no display, so there is
+ * nothing to show and nothing to compare. Pressing it is the assertion that
+ * whoever turns up next is the owner, which is worth exactly as much as
+ * physical access to the dongle -- and that is the same thing the cable was
+ * worth when it was the only path. */
+static void scurry_on_button(int presses)
+{
+    if (presses < SCURRY_PAIR_PRESSES) {
+        return;
+    }
+    if (scurry_ctl_svc_pairing_remaining() > 0) {
+        /* A second triple press is the way out, for a window opened by mistake
+           or by somebody else. Waiting out the timeout would be the only other
+           option and it is a long minute if you know you have erred. */
+        scurry_ctl_svc_close_pairing();
+        return;
+    }
+    scurry_ctl_svc_open_pairing(SCURRY_PAIR_WINDOW_S);
+}
+
 /* Report the wireless link's state: whether a controller is live, whether one
    is pinned, and how long any pairing window has left. */
 static void scurry_send_wireless(void)
@@ -1175,4 +1204,5 @@ void app_main(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
 
     xTaskCreate(&scurry_reader_task, "scurry_rx", 4096, NULL, 5, NULL);
+    scurry_button_start(SCURRY_BUTTON_GPIO, scurry_on_button);
 }
