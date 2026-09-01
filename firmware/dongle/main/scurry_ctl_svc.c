@@ -83,52 +83,103 @@ static uint16_t handles[SCURRY_IDX_NB];
 static esp_gatt_if_t ctl_gatts_if = ESP_GATT_IF_NONE;
 static scurry_ctl_rx_cb_t rx_cb;
 
-/* The controller's connection, once one has identified itself by writing or
- * subscribing. Not recorded on connect: at connect time there is no way to tell
- * a controller from a target, since both are just centrals opening a link. */
-static bool ctl_have_conn;
-static uint16_t ctl_conn_id;
-static esp_bd_addr_t ctl_bda;
-static bool ctl_subscribed;
-
 /* Negotiated ATT MTU, which bounds a single notification at mtu-3. Frames
  * larger than that are split; the controller reassembles from the byte stream
  * exactly as the dongle does for writes coming the other way. */
 static uint16_t ctl_mtu = 23;
 
-static bool pin_valid;
-static esp_bd_addr_t pin_bda;
+/* Connected controllers.
+ *
+ * Nothing is recorded on connect: at connect time there is no way to tell a
+ * controller from a target, since both are just centrals opening a link. An
+ * entry appears once a peer proves it is authorised, by subscribing or writing. */
+struct ctl_conn {
+    bool used;
+    bool subscribed;
+    uint16_t conn_id;
+    esp_bd_addr_t bda;
+};
+static struct ctl_conn conns[SCURRY_MAX_CONTROLLERS];
+
+/* Which of them is driving, or -1. */
+static int active = -1;
+/* Bumped on every change of driver; see the header. */
+static uint32_t generation;
+/* The connection whose request is being handled, so an answer goes back to
+ * whoever asked rather than to whoever happens to be driving. */
+static int replying_to = -1;
+
+/* Authorised controllers, whether or not they are here. */
+static esp_bd_addr_t pins[SCURRY_MAX_CONTROLLERS];
+static int pin_count;
 static int64_t pairing_until_us;
 
-static void pin_save(const esp_bd_addr_t bda)
+static bool same(const esp_bd_addr_t a, const esp_bd_addr_t b)
 {
-    memcpy(pin_bda, bda, sizeof(esp_bd_addr_t));
-    pin_valid = true;
+    return memcmp(a, b, sizeof(esp_bd_addr_t)) == 0;
+}
 
+static void pins_save(void)
+{
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
-        ESP_LOGW(TAG, "could not open NVS to store the controller address");
+        ESP_LOGW(TAG, "could not open NVS to store controller addresses");
         return;
     }
-    if (nvs_set_blob(h, NVS_KEY_CTL_BDA, bda, sizeof(esp_bd_addr_t)) == ESP_OK) {
-        nvs_commit(h);
+    if (pin_count == 0) {
+        nvs_erase_key(h, NVS_KEY_CTL_BDA);
+    } else {
+        nvs_set_blob(h, NVS_KEY_CTL_BDA, pins, pin_count * sizeof(esp_bd_addr_t));
     }
+    nvs_commit(h);
     nvs_close(h);
 }
 
-static void pin_load(void)
+static void pins_load(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
         return;
     }
-    size_t len = sizeof(esp_bd_addr_t);
-    if (nvs_get_blob(h, NVS_KEY_CTL_BDA, pin_bda, &len) == ESP_OK && len == sizeof(esp_bd_addr_t)) {
-        pin_valid = true;
-        ESP_LOGI(TAG, "controller pinned to %02x:%02x:%02x:%02x:%02x:%02x", pin_bda[0], pin_bda[1],
-                 pin_bda[2], pin_bda[3], pin_bda[4], pin_bda[5]);
+    size_t len = sizeof(pins);
+    if (nvs_get_blob(h, NVS_KEY_CTL_BDA, pins, &len) == ESP_OK) {
+        /* A six-byte blob is what earlier firmware wrote for its single
+         * controller. It decodes here as one entry, so an existing pairing
+         * survives the upgrade rather than silently needing to be redone. */
+        pin_count = (int)(len / sizeof(esp_bd_addr_t));
+        if (pin_count > SCURRY_MAX_CONTROLLERS) {
+            pin_count = SCURRY_MAX_CONTROLLERS;
+        }
+        for (int i = 0; i < pin_count; i++) {
+            ESP_LOGI(TAG, "controller %d authorised: %02x:%02x:%02x:%02x:%02x:%02x", i, pins[i][0],
+                     pins[i][1], pins[i][2], pins[i][3], pins[i][4], pins[i][5]);
+        }
     }
     nvs_close(h);
+}
+
+bool scurry_ctl_svc_is_pinned(const esp_bd_addr_t bda)
+{
+    for (int i = 0; i < pin_count; i++) {
+        if (same(pins[i], bda)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int scurry_ctl_svc_pin_count(void)
+{
+    return pin_count;
+}
+
+bool scurry_ctl_svc_pin_at(int index, esp_bd_addr_t out)
+{
+    if (index < 0 || index >= pin_count) {
+        return false;
+    }
+    memcpy(out, pins[index], sizeof(esp_bd_addr_t));
+    return true;
 }
 
 static bool pairing_open(void)
@@ -139,7 +190,7 @@ static bool pairing_open(void)
 void scurry_ctl_svc_open_pairing(uint32_t seconds)
 {
     pairing_until_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
-    ESP_LOGI(TAG, "pairing window open for %us -- the next controller to subscribe is pinned",
+    ESP_LOGI(TAG, "pairing window open for %us -- the next controller to turn up is authorised",
              (unsigned)seconds);
 }
 
@@ -159,90 +210,136 @@ uint32_t scurry_ctl_svc_pairing_remaining(void)
     return (uint32_t)((pairing_until_us - esp_timer_get_time()) / 1000000) + 1;
 }
 
-bool scurry_ctl_svc_pinned(esp_bd_addr_t out)
-{
-    if (!pin_valid) {
-        return false;
-    }
-    memcpy(out, pin_bda, sizeof(esp_bd_addr_t));
-    return true;
-}
-
 void scurry_ctl_svc_forget(void)
 {
-    pin_valid = false;
-    memset(pin_bda, 0, sizeof(pin_bda));
+    pin_count = 0;
+    memset(pins, 0, sizeof(pins));
     pairing_until_us = 0;
-    ctl_have_conn = false;
-    ctl_subscribed = false;
-
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_key(h, NVS_KEY_CTL_BDA);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-    ESP_LOGI(TAG, "wireless controller forgotten");
+    memset(conns, 0, sizeof(conns));
+    active = -1;
+    generation++;
+    pins_save();
+    ESP_LOGI(TAG, "all wireless controllers forgotten");
 }
 
 /* Whether this peer may drive the machine.
  *
- * Encryption alone is not enough: Just Works bonding means anything in range
- * can hold an encrypted link. The address must also be the pinned one, and the
- * only way to become the pinned one is to turn up while a window opened over
- * the cable is still running. */
+ * Encryption alone is not enough: Just Works bonding means anything in range can
+ * hold an encrypted link. The address must also be authorised, and the only way
+ * to become authorised is to turn up while a window is open -- which takes
+ * either the dongle's button or the cable. */
 static bool authorised(const esp_bd_addr_t bda)
 {
-    if (pin_valid && memcmp(pin_bda, bda, sizeof(esp_bd_addr_t)) == 0) {
+    if (scurry_ctl_svc_is_pinned(bda)) {
         return true;
     }
-    if (pairing_open()) {
-        pin_save(bda);
-        pairing_until_us = 0;
-        ESP_LOGI(TAG, "controller %02x:%02x:%02x:%02x:%02x:%02x pinned", bda[0], bda[1], bda[2],
-                 bda[3], bda[4], bda[5]);
-        return true;
+    if (!pairing_open()) {
+        return false;
     }
-    return false;
+    if (pin_count >= SCURRY_MAX_CONTROLLERS) {
+        /* Refuse rather than evict. Silently dropping whichever controller
+           happened to be oldest would take the machine somebody is sitting at
+           out from under them. */
+        ESP_LOGW(TAG, "pairing window open but all %d controller slots are taken; forget one first",
+                 SCURRY_MAX_CONTROLLERS);
+        return false;
+    }
+    memcpy(pins[pin_count++], bda, sizeof(esp_bd_addr_t));
+    pins_save();
+    scurry_ctl_svc_close_pairing();
+    ESP_LOGI(TAG, "controller %02x:%02x:%02x:%02x:%02x:%02x authorised (%d of %d)", bda[0], bda[1],
+             bda[2], bda[3], bda[4], bda[5], pin_count, SCURRY_MAX_CONTROLLERS);
+    return true;
+}
+
+/* Find or make this peer's connection entry. */
+static int conn_slot(uint16_t conn_id, const esp_bd_addr_t bda)
+{
+    for (int i = 0; i < SCURRY_MAX_CONTROLLERS; i++) {
+        if (conns[i].used && same(conns[i].bda, bda)) {
+            conns[i].conn_id = conn_id;
+            return i;
+        }
+    }
+    for (int i = 0; i < SCURRY_MAX_CONTROLLERS; i++) {
+        if (!conns[i].used) {
+            conns[i].used = true;
+            conns[i].subscribed = false;
+            conns[i].conn_id = conn_id;
+            memcpy(conns[i].bda, bda, sizeof(esp_bd_addr_t));
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Hand the wheel to this controller.
+ *
+ * Driven by writing, not by connecting or subscribing. That distinction is the
+ * whole point: macOS reconnects bonded devices in the background, so a laptop
+ * waking in another room would otherwise take control away from the phone in
+ * your hand without anybody touching anything. Whoever is actually sending
+ * input is the one driving. */
+static void make_active(int slot)
+{
+    if (slot < 0 || active == slot) {
+        return;
+    }
+    if (active >= 0) {
+        const uint8_t *b = conns[slot].bda;
+        ESP_LOGI(TAG, "controller %02x:%02x:%02x:%02x:%02x:%02x took over", b[0], b[1], b[2], b[3],
+                 b[4], b[5]);
+    }
+    active = slot;
+    generation++;
+}
+
+uint32_t scurry_ctl_svc_generation(void)
+{
+    return generation;
 }
 
 void scurry_ctl_svc_init(scurry_ctl_rx_cb_t on_rx)
 {
     rx_cb = on_rx;
-    pin_load();
+    pins_load();
 }
 
 bool scurry_ctl_svc_ready(void)
 {
-    return ctl_have_conn && ctl_subscribed;
+    return active >= 0 && conns[active].used && conns[active].subscribed;
 }
 
-bool scurry_ctl_svc_conn(uint16_t *conn_id, esp_bd_addr_t bda)
+bool scurry_ctl_svc_active_bda(esp_bd_addr_t out)
 {
-    if (!ctl_have_conn) {
+    if (active < 0 || !conns[active].used) {
         return false;
     }
-    if (conn_id) {
-        *conn_id = ctl_conn_id;
-    }
-    if (bda) {
-        memcpy(bda, ctl_bda, sizeof(esp_bd_addr_t));
-    }
+    memcpy(out, conns[active].bda, sizeof(esp_bd_addr_t));
     return true;
 }
 
 void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda)
 {
-    if (ctl_have_conn && memcmp(ctl_bda, bda, sizeof(esp_bd_addr_t)) == 0) {
-        ctl_have_conn = false;
-        ctl_subscribed = false;
-        ESP_LOGI(TAG, "wireless controller disconnected");
+    for (int i = 0; i < SCURRY_MAX_CONTROLLERS; i++) {
+        if (conns[i].used && same(conns[i].bda, bda)) {
+            conns[i].used = false;
+            conns[i].subscribed = false;
+            if (active == i) {
+                active = -1;
+                generation++;
+                ESP_LOGI(TAG, "the driving controller disconnected");
+            }
+            return;
+        }
     }
 }
 
-void scurry_ctl_svc_notify(const uint8_t *data, uint16_t len)
+/* Send to one connection, splitting at the negotiated MTU. */
+static void notify_slot(int slot, const uint8_t *data, uint16_t len)
 {
-    if (!scurry_ctl_svc_ready() || ctl_gatts_if == ESP_GATT_IF_NONE || len == 0) {
+    if (slot < 0 || !conns[slot].used || !conns[slot].subscribed ||
+        ctl_gatts_if == ESP_GATT_IF_NONE || len == 0) {
         return;
     }
     uint16_t chunk = ctl_mtu > 3 ? ctl_mtu - 3 : 20;
@@ -254,9 +351,19 @@ void scurry_ctl_svc_notify(const uint8_t *data, uint16_t len)
         if (n > chunk) {
             n = chunk;
         }
-        esp_ble_gatts_send_indicate(ctl_gatts_if, ctl_conn_id, handles[SCURRY_IDX_EVENT_VAL], n,
-                                    (uint8_t *)data + off, false);
+        esp_ble_gatts_send_indicate(ctl_gatts_if, conns[slot].conn_id,
+                                    handles[SCURRY_IDX_EVENT_VAL], n, (uint8_t *)data + off, false);
     }
+}
+
+void scurry_ctl_svc_notify(const uint8_t *data, uint16_t len)
+{
+    notify_slot(active, data, len);
+}
+
+void scurry_ctl_svc_reply(const uint8_t *data, uint16_t len)
+{
+    notify_slot(replying_to >= 0 ? replying_to : active, data, len);
 }
 
 void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -264,14 +371,14 @@ void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 {
     switch (event) {
     case ESP_GATTS_REG_EVT: {
-        ESP_LOGI(TAG, "REG_EVT app_id=%04x status=%d if=%d", param->reg.app_id, param->reg.status,
-                 gatts_if);
         if (param->reg.app_id != SCURRY_CTL_APP_ID) {
             break;
         }
         ctl_gatts_if = gatts_if;
         esp_err_t err = esp_ble_gatts_create_attr_tab(scurry_ctl_db, gatts_if, SCURRY_IDX_NB, 0);
-        ESP_LOGI(TAG, "create_attr_tab -> %s", esp_err_to_name(err));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "create_attr_tab -> %s", esp_err_to_name(err));
+        }
         break;
     }
 
@@ -293,41 +400,51 @@ void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
              * never needed. Refusing it is better than half-supporting it. */
             break;
         }
-        if (param->write.handle == handles[SCURRY_IDX_EVENT_CCC] && param->write.len == 2) {
-            bool on = (param->write.value[0] | (param->write.value[1] << 8)) != 0;
-            if (on && !authorised(param->write.bda)) {
-                ESP_LOGW(TAG,
-                         "refusing %02x:%02x:%02x:%02x:%02x:%02x -- not the pinned controller "
-                         "and no pairing window is open",
-                         param->write.bda[0], param->write.bda[1], param->write.bda[2],
-                         param->write.bda[3], param->write.bda[4], param->write.bda[5]);
-                esp_ble_gatts_close(gatts_if, param->write.conn_id);
-                break;
-            }
-            ctl_subscribed = on;
-            if (on) {
-                ctl_have_conn = true;
-                ctl_conn_id = param->write.conn_id;
-                memcpy(ctl_bda, param->write.bda, sizeof(esp_bd_addr_t));
-                ESP_LOGI(TAG, "wireless controller subscribed (conn %d)", param->write.conn_id);
-            }
+
+        bool ours = param->write.handle == handles[SCURRY_IDX_EVENT_CCC] ||
+                    param->write.handle == handles[SCURRY_IDX_CONTROL_VAL];
+        if (!ours) {
+            break;
+        }
+        if (!authorised(param->write.bda)) {
+            ESP_LOGW(TAG,
+                     "refusing %02x:%02x:%02x:%02x:%02x:%02x -- not an authorised controller "
+                     "and no pairing window is open",
+                     param->write.bda[0], param->write.bda[1], param->write.bda[2],
+                     param->write.bda[3], param->write.bda[4], param->write.bda[5]);
+            esp_ble_gatts_close(gatts_if, param->write.conn_id);
             break;
         }
 
-        if (param->write.handle == handles[SCURRY_IDX_CONTROL_VAL]) {
-            if (!authorised(param->write.bda)) {
-                esp_ble_gatts_close(gatts_if, param->write.conn_id);
+        int slot = conn_slot(param->write.conn_id, param->write.bda);
+        if (slot < 0) {
+            ESP_LOGW(TAG, "no room to track another controller connection");
+            break;
+        }
+
+        if (param->write.handle == handles[SCURRY_IDX_EVENT_CCC]) {
+            if (param->write.len < 2) {
                 break;
             }
-            /* Record the connection here too: a controller that writes before
-             * subscribing is still the controller. */
-            ctl_have_conn = true;
-            ctl_conn_id = param->write.conn_id;
-            memcpy(ctl_bda, param->write.bda, sizeof(esp_bd_addr_t));
-            if (rx_cb && param->write.len > 0) {
-                rx_cb(param->write.value, param->write.len);
+            conns[slot].subscribed = (param->write.value[0] | (param->write.value[1] << 8)) != 0;
+            /* Subscribing does not take the wheel; writing does. But a lone
+               controller should not have to send input before it can be told
+               anything, so the first one to arrive drives by default. */
+            if (conns[slot].subscribed && active < 0) {
+                make_active(slot);
             }
+            ESP_LOGI(TAG, "controller %s (conn %d)",
+                     conns[slot].subscribed ? "subscribed" : "unsubscribed", param->write.conn_id);
+            break;
         }
+
+        /* A write is somebody driving. */
+        make_active(slot);
+        replying_to = slot;
+        if (rx_cb && param->write.len > 0) {
+            rx_cb(param->write.value, param->write.len);
+        }
+        replying_to = -1;
         break;
     }
 

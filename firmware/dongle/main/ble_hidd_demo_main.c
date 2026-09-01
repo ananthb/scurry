@@ -107,9 +107,7 @@ static void scurry_conn_add(uint16_t conn_id, esp_bd_addr_t bda)
        and, worse, route the pointer to the very machine the pointer came from.
        Observed: a Mac bonding for the control link took node 1 and displaced
        the phone that was pinned to it. */
-    esp_bd_addr_t controller;
-    if (scurry_ctl_svc_pinned(controller) &&
-        memcmp(controller, bda, sizeof(esp_bd_addr_t)) == 0) {
+    if (scurry_ctl_svc_is_pinned(bda)) {
         ESP_LOGI(HID_DEMO_TAG, "scurry: %02x:%02x:%02x:%02x:%02x:%02x is the controller, not a target",
                  bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
         return;
@@ -450,7 +448,8 @@ static bool scurry_seq_accept(uint16_t seq)
    frame does not have to live on its stack. */
 static uint8_t scurry_tx_buf[SCURRY_HEADER_LEN + SCURRY_MAX_PAYLOAD];
 
-static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint16_t len)
+static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint16_t len,
+                        bool is_reply)
 {
     if (len > SCURRY_MAX_PAYLOAD) {
         return;
@@ -478,7 +477,16 @@ static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint
         usb_serial_jtag_write_bytes(h, total, 20 / portTICK_PERIOD_MS);
     }
     if (dest & SCURRY_TO_BLE) {
-        scurry_ctl_svc_notify(h, total);
+        /* An answer goes back to whoever asked; an announcement goes to
+           whoever is driving. With more than one controller authorised those
+           are not always the same connection, and a settings window opened on
+           the machine that is not currently in charge would otherwise wait for
+           a reply delivered to somebody else. */
+        if (is_reply) {
+            scurry_ctl_svc_reply(h, total);
+        } else {
+            scurry_ctl_svc_notify(h, total);
+        }
     }
 }
 
@@ -486,13 +494,13 @@ static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint
    controller that needs to hear it. */
 static void scurry_send(uint8_t kind, const uint8_t *payload, uint16_t len)
 {
-    scurry_emit(SCURRY_TO_USB | SCURRY_TO_BLE, kind, payload, len);
+    scurry_emit(SCURRY_TO_USB | SCURRY_TO_BLE, kind, payload, len, false);
 }
 
 /* An answer: back to whoever asked. */
 static void scurry_reply(uint8_t kind, const uint8_t *payload, uint16_t len)
 {
-    scurry_emit(scurry_reply_to, kind, payload, len);
+    scurry_emit(scurry_reply_to, kind, payload, len, true);
 }
 
 static void scurry_send_ack(uint8_t code)
@@ -888,16 +896,23 @@ static void scurry_on_button(int presses)
    is pinned, and how long any pairing window has left. */
 static void scurry_send_wireless(void)
 {
-    uint8_t buf[9] = {0};
+    /* Nine bytes of header, then one address per authorised controller. */
+    uint8_t buf[9 + SCURRY_MAX_CONTROLLERS * 6] = {0};
     esp_bd_addr_t bda;
     buf[0] = scurry_ctl_svc_ready() ? 1 : 0;
-    buf[1] = scurry_ctl_svc_pinned(bda) ? 1 : 0;
-    if (buf[1]) {
-        memcpy(&buf[2], bda, 6);
+    if (scurry_ctl_svc_active_bda(bda)) {
+        memcpy(&buf[1], bda, 6);
     }
     uint32_t left = scurry_ctl_svc_pairing_remaining();
-    buf[8] = left > 255 ? 255 : (uint8_t)left;
-    scurry_reply(SCURRY_KIND_WIRELESS, buf, sizeof(buf));
+    buf[7] = left > 255 ? 255 : (uint8_t)left;
+
+    int n = scurry_ctl_svc_pin_count();
+    buf[8] = (uint8_t)n;
+    for (int i = 0; i < n; i++) {
+        scurry_ctl_svc_pin_at(i, bda);
+        memcpy(&buf[9 + i * 6], bda, 6);
+    }
+    scurry_reply(SCURRY_KIND_WIRELESS, buf, (uint16_t)(9 + n * 6));
 }
 
 /* Open a pairing window, or forget the controller entirely.
@@ -1041,6 +1056,8 @@ static void scurry_framer_feed(scurry_framer_t *f, const uint8_t *data, size_t l
 
 static scurry_framer_t scurry_usb_framer;
 static scurry_framer_t scurry_ble_framer;
+/* The driver the BLE framer's held bytes belong to. */
+static uint32_t scurry_ble_generation;
 
 /* Bytes the wireless controller has written, waiting for the reader task.
  *
@@ -1102,8 +1119,18 @@ void scurry_reader_task(void *pvParameters)
                    seated as one before it said what it was. Idempotent, so this
                    costs four memcmps once and nothing after. */
                 esp_bd_addr_t bda;
-                if (scurry_ctl_svc_conn(NULL, bda)) {
+                if (scurry_ctl_svc_active_bda(bda)) {
                     scurry_conn_remove(bda);
+                }
+                /* A different controller is driving than when the buffer last
+                   had bytes in it. Whatever partial frame is held belongs to
+                   the previous one, and splicing the next controller's first
+                   bytes onto its tail would produce a frame neither of them
+                   sent. */
+                uint32_t gen = scurry_ctl_svc_generation();
+                if (gen != scurry_ble_generation) {
+                    scurry_ble_generation = gen;
+                    scurry_ble_framer.filled = 0;
                 }
                 scurry_framer_feed(&scurry_ble_framer, item, got, SCURRY_TO_BLE);
                 vRingbufferReturnItem(scurry_ble_rb, item);

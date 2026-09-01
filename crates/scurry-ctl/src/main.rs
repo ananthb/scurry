@@ -315,20 +315,31 @@ fn format_bda(bda: [u8; 6]) -> String {
     bda.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
-/// Show whether a controller is authorised, and whether one is here now.
+/// Show which controllers are authorised, and which one has the wheel.
 fn wireless() -> Result<()> {
     let msg = open_link()?.request(kind::GET_WIRELESS, &[], kind::WIRELESS)?;
     let w = WirelessState::decode(&msg.payload)
         .context("the dongle sent a wireless state it could not have meant")?;
 
-    println!("controller:  {}", if w.pinned { format_bda(w.bda) } else { "none authorised".into() });
-    println!("connected:   {}", if w.ready { "yes" } else { "no" });
-    if w.window_secs > 0 {
-        println!("pairing:     open, {}s left", w.window_secs);
+    if w.controllers().is_empty() {
+        println!("no controllers authorised");
     } else {
-        println!("pairing:     closed");
+        println!("{:<20} state", "controller");
+        for bda in w.controllers() {
+            // Driving is not the same as connected: several may be connected
+            // at once and exactly one sends input.
+            let state = if w.is_active(bda) {
+                if w.ready { "driving" } else { "connected" }
+            } else {
+                "authorised"
+            };
+            println!("{:<20} {state}", format_bda(*bda));
+        }
     }
-    if !w.pinned {
+
+    if w.window_secs > 0 {
+        println!("\npairing window open, {}s left", w.window_secs);
+    } else if w.controllers().is_empty() {
         println!();
         println!("Press the dongle's button three times, or run `scurry-ctl pair`,");
         println!("then start the controller with --wireless while the window is open.");

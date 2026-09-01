@@ -486,43 +486,98 @@ impl SlotStatus {
     }
 }
 
+/// How many controllers the dongle will authorise at once.
+///
+/// More than one because a laptop is not the only thing that might drive this:
+/// a phone should be able to take over without the laptop having to be
+/// forgotten and re-paired to get it back. Exactly one drives at a time.
+pub const MAX_CONTROLLERS: usize = 4;
+
 /// The wireless control link's state, as it appears inside a
 /// [`kind::WIRELESS`] payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WirelessState {
-    /// A controller is connected and subscribed right now.
+    /// A controller is connected, subscribed, and driving right now.
     pub ready: bool,
-    /// A controller has been authorised, whether or not it is here.
-    pub pinned: bool,
-    /// Its address; all zero when nothing is pinned.
-    pub bda: [u8; 6],
+    /// Which one is driving; all zero when none is.
+    pub active: [u8; 6],
     /// Seconds left in the pairing window, 0 when closed.
     pub window_secs: u8,
+    /// How many entries of `controllers` are meaningful.
+    pub count: u8,
+    /// Every authorised controller, driving or not.
+    pub controllers: [[u8; 6]; MAX_CONTROLLERS],
+}
+
+impl Default for WirelessState {
+    fn default() -> Self {
+        Self {
+            ready: false,
+            active: [0u8; 6],
+            window_secs: 0,
+            count: 0,
+            controllers: [[0u8; 6]; MAX_CONTROLLERS],
+        }
+    }
 }
 
 impl WirelessState {
-    pub const WIRE_LEN: usize = 9;
+    /// Bytes before the list of authorised controllers.
+    pub const HEADER_LEN: usize = 9;
 
-    pub fn encode(&self) -> [u8; Self::WIRE_LEN] {
-        let mut b = [0u8; Self::WIRE_LEN];
-        b[0] = u8::from(self.ready);
-        b[1] = u8::from(self.pinned);
-        b[2..8].copy_from_slice(&self.bda);
-        b[8] = self.window_secs;
-        b
+    pub fn count(&self) -> usize {
+        core::cmp::min(self.count as usize, MAX_CONTROLLERS)
+    }
+
+    /// Every authorised controller, without the padding.
+    pub fn controllers(&self) -> &[[u8; 6]] {
+        &self.controllers[..self.count()]
+    }
+
+    /// True when this address is the one currently driving.
+    pub fn is_active(&self, bda: &[u8; 6]) -> bool {
+        self.active != [0u8; 6] && &self.active == bda
+    }
+
+    /// Returns how many bytes were written, or None if `out` is too small.
+    pub fn encode_into(&self, out: &mut [u8]) -> Option<usize> {
+        let n = self.count();
+        let need = Self::HEADER_LEN + n * 6;
+        if out.len() < need {
+            return None;
+        }
+        out[..need].fill(0);
+        out[0] = u8::from(self.ready);
+        out[1..7].copy_from_slice(&self.active);
+        out[7] = self.window_secs;
+        out[8] = n as u8;
+        for (i, c) in self.controllers[..n].iter().enumerate() {
+            out[Self::HEADER_LEN + i * 6..Self::HEADER_LEN + i * 6 + 6].copy_from_slice(c);
+        }
+        Some(need)
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < Self::WIRE_LEN {
+        if b.len() < Self::HEADER_LEN {
             return None;
         }
-        let mut bda = [0u8; 6];
-        bda.copy_from_slice(&b[2..8]);
+        let mut active = [0u8; 6];
+        active.copy_from_slice(&b[1..7]);
+        // Clamped rather than trusted: a corrupt count must not make this read
+        // past what actually arrived.
+        let count = core::cmp::min(b[8] as usize, MAX_CONTROLLERS);
+        let count = core::cmp::min(count, (b.len() - Self::HEADER_LEN) / 6);
+        let mut controllers = [[0u8; 6]; MAX_CONTROLLERS];
+        for (i, slot) in controllers.iter_mut().enumerate().take(count) {
+            let off = Self::HEADER_LEN + i * 6;
+            slot.copy_from_slice(&b[off..off + 6]);
+        }
         Some(Self {
             ready: b[0] != 0,
-            pinned: b[1] != 0,
-            bda,
-            window_secs: b[8],
+            active,
+            window_secs: b[7],
+            count: count as u8,
+            controllers,
         })
     }
 }
@@ -721,13 +776,42 @@ mod tests {
 
     #[test]
     fn wireless_state_roundtrips() {
-        let w = WirelessState {
+        let mut w = WirelessState {
             ready: true,
-            pinned: true,
-            bda: [0x84, 0x2f, 0x57, 0x29, 0x63, 0x64],
+            active: [0x84, 0x2f, 0x57, 0x29, 0x63, 0x64],
             window_secs: 42,
+            count: 2,
+            ..Default::default()
         };
-        assert_eq!(WirelessState::decode(&w.encode()).unwrap(), w);
+        w.controllers[0] = [0x84, 0x2f, 0x57, 0x29, 0x63, 0x64];
+        w.controllers[1] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+
+        let mut buf = [0u8; 64];
+        let n = w.encode_into(&mut buf).unwrap();
+        assert_eq!(n, WirelessState::HEADER_LEN + 12);
+        let got = WirelessState::decode(&buf[..n]).unwrap();
+        assert_eq!(got, w);
+        assert_eq!(got.controllers().len(), 2);
+        assert!(got.is_active(&[0x84, 0x2f, 0x57, 0x29, 0x63, 0x64]));
+        assert!(!got.is_active(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+    }
+
+    #[test]
+    fn a_lying_controller_count_cannot_read_past_the_payload() {
+        // The dongle is trusted, but a truncated or corrupt reply is not: a
+        // count of four with one address present must yield one, not a panic.
+        let mut buf = [0u8; WirelessState::HEADER_LEN + 6];
+        buf[8] = 4;
+        let got = WirelessState::decode(&buf).unwrap();
+        assert_eq!(got.controllers().len(), 1);
+    }
+
+    #[test]
+    fn nothing_driving_is_not_mistaken_for_an_address() {
+        // All-zero means "nobody", and must not compare equal to a real
+        // controller that happens to be asked about.
+        let w = WirelessState::default();
+        assert!(!w.is_active(&[0u8; 6]));
     }
 
     #[test]

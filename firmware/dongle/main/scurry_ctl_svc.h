@@ -6,8 +6,8 @@
  * this one, and all of it is one radio and one GATT database.
  *
  * The cable is not replaced by this. It remains the configuration path and the
- * fallback, and -- see the pairing window below -- it is also what authorises a
- * controller to use the wireless path at all.
+ * fallback, and -- see the pairing window below -- it is also one of the two
+ * ways a controller is authorised in the first place.
  */
 
 #pragma once
@@ -21,10 +21,17 @@
 /* One GATT app id of our own, distinct from the HID and battery profiles. */
 #define SCURRY_CTL_APP_ID 0x5343
 
-/* Handed every byte the controller writes to the control characteristic. The
- * bytes are a stream, not a message: BLE writes are bounded by the negotiated
- * MTU and a config payload is larger than any MTU a host will agree to, so a
- * frame routinely arrives in pieces. The caller reassembles. */
+/* How many controllers may be authorised at once.
+ *
+ * More than one, because a laptop is not the only thing that might drive this:
+ * a phone should be able to take over without the laptop having to be forgotten
+ * and re-paired to get it back afterwards. Exactly one drives at a time. */
+#define SCURRY_MAX_CONTROLLERS 4
+
+/* Handed every byte the driving controller writes. The bytes are a stream, not
+ * a message: BLE writes are bounded by the negotiated MTU and a config payload
+ * is larger than any MTU a host will agree to, so a frame routinely arrives in
+ * pieces. The caller reassembles. */
 typedef void (*scurry_ctl_rx_cb_t)(const uint8_t *data, uint16_t len);
 
 void scurry_ctl_svc_init(scurry_ctl_rx_cb_t on_rx);
@@ -34,16 +41,33 @@ void scurry_ctl_svc_init(scurry_ctl_rx_cb_t on_rx);
 void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                                 esp_ble_gatts_cb_param_t *param);
 
-/* True once a controller is connected, subscribed, and authorised. */
+/* True once a controller is connected, subscribed and driving. */
 bool scurry_ctl_svc_ready(void);
 
-/* Send a frame to the controller. Silently does nothing when no controller is
- * subscribed, which is the ordinary state when running on the cable. */
+/* Send an announcement to whichever controller is driving. Silently does
+ * nothing when none is, which is the ordinary state on the cable. */
 void scurry_ctl_svc_notify(const uint8_t *data, uint16_t len);
 
-/* The control central's connection, so the connection table can refuse to seat
- * it as a target. Returns false when there is no control connection. */
-bool scurry_ctl_svc_conn(uint16_t *conn_id, esp_bd_addr_t bda);
+/* Send an answer to the controller whose request is being handled.
+ *
+ * Distinct from notify. A controller that is connected but not driving must
+ * still get answers to its own queries, or opening the settings window on the
+ * machine that is not currently in charge would silently time out. */
+void scurry_ctl_svc_reply(const uint8_t *data, uint16_t len);
+
+/* Bumped whenever the driving controller changes.
+ *
+ * The reader compares it to decide whether the bytes it is holding still belong
+ * to the same stream: a half-delivered frame from the previous controller must
+ * not have the next one's first bytes spliced onto it. */
+uint32_t scurry_ctl_svc_generation(void);
+
+/* Which controller is driving, if any. */
+bool scurry_ctl_svc_active_bda(esp_bd_addr_t out);
+
+/* True if this address is authorised at all, driving or not -- so no controller
+ * is ever seated as a target, even while another one holds the wheel. */
+bool scurry_ctl_svc_is_pinned(const esp_bd_addr_t bda);
 
 void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda);
 
@@ -68,7 +92,12 @@ void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda);
  * or every target would start being asked to type a code at a mouse. */
 void scurry_ctl_svc_open_pairing(uint32_t seconds);
 void scurry_ctl_svc_close_pairing(void);
-bool scurry_ctl_svc_pinned(esp_bd_addr_t out);
-void scurry_ctl_svc_forget(void);
 /* Seconds left in the pairing window, 0 when closed. */
 uint32_t scurry_ctl_svc_pairing_remaining(void);
+
+/* How many controllers are authorised, and their addresses. */
+int scurry_ctl_svc_pin_count(void);
+bool scurry_ctl_svc_pin_at(int index, esp_bd_addr_t out);
+
+/* Revoke every authorised controller. */
+void scurry_ctl_svc_forget(void);
