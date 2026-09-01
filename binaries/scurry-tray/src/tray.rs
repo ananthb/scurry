@@ -10,11 +10,12 @@
 //! process, since winit permits one event loop per process -- can reach the
 //! dongle without opening the port a second time.
 
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use scurry_ctl::ipc::DaemonState;
+use scurry_ctl::ipc::{ack_message, DaemonState};
 use scurry_ctl::transport::Dongle;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
@@ -34,7 +35,17 @@ const REFRESH: Duration = Duration::from_secs(2);
 #[cfg(target_os = "macos")]
 const MAX_CAPTURE_BACKOFF: Duration = Duration::from_secs(60);
 
+/// How long a wireless scan runs before giving up and letting the next poll
+/// start another.
+const SCAN_FOR: Duration = Duration::from_secs(6);
+
+/// How long to wait between wireless scans when none has succeeded. Scanning is
+/// not free -- it keeps the radio listening -- and a dongle that is simply
+/// switched off should not cost a continuous scan all day.
+const SCAN_EVERY: Duration = Duration::from_secs(20);
+
 const ID_SETTINGS: &str = "settings";
+const ID_PAIR: &str = "pair";
 const ID_LOGIN: &str = "login";
 const ID_QUIT: &str = "quit";
 
@@ -93,8 +104,18 @@ struct App {
     /// must not rebuild unconditionally -- doing that made the menu close the
     /// moment it was opened, roughly every two seconds. Rebuild only when
     /// something a person would see has actually changed.
-    rendered: Option<(Snapshot, bool)>,
+    rendered: Option<(Snapshot, bool, bool)>,
     next_refresh: Instant,
+    /// True while the held link is over the air rather than the cable. Cached
+    /// rather than read from the link, so building the menu never waits behind
+    /// a pointer report holding the same mutex.
+    wireless: bool,
+    /// A wireless scan in flight. Scanning takes seconds and the menu is built
+    /// on this thread, so it cannot happen inline -- a six-second freeze of the
+    /// menu bar every poll is worse than not finding the dongle.
+    searching: Option<mpsc::Receiver<Option<Dongle>>>,
+    /// When the next wireless scan may start.
+    next_scan: Instant,
     /// Set when the reader reports the device gone, and cleared only once the
     /// port has actually been reopened. Sticky, because the user may take a
     /// while to plug the dongle back in and there is nothing to do until they
@@ -121,6 +142,9 @@ impl App {
             snapshot: Arc::new(Mutex::new(Snapshot::NoDongle)),
             rendered: None,
             next_refresh: Instant::now(),
+            wireless: false,
+            searching: None,
+            next_scan: Instant::now(),
             link_failed: false,
             #[cfg(target_os = "macos")]
             next_capture_try: Instant::now(),
@@ -198,7 +222,61 @@ impl App {
         self.try_start_capture();
     }
 
-    /// Reopen the serial port into the handle everything already holds.
+    /// Produce a link, preferring the cable.
+    ///
+    /// The cable first because it opens in microseconds and is two orders of
+    /// magnitude faster once open, so a dongle sitting on a desk with a cable in
+    /// it behaves exactly as it always did. Wireless is the fallback for when
+    /// the dongle is somewhere else entirely.
+    ///
+    /// Returns `None` while a wireless scan is still running. That is not a
+    /// failure -- the next poll asks again.
+    fn find_link(&mut self) -> Option<Dongle> {
+        if let Ok(path) = Dongle::autodetect() {
+            match Dongle::open(&path) {
+                Ok(d) => {
+                    self.searching = None;
+                    return Some(d);
+                }
+                // Present but unopenable is usually another process holding it.
+                // Not worth a wireless scan; the next poll will retry.
+                Err(e) => {
+                    eprintln!("found {path} but could not open it: {e}");
+                    return None;
+                }
+            }
+        }
+
+        if let Some(rx) = &self.searching {
+            return match rx.try_recv() {
+                Ok(found) => {
+                    self.searching = None;
+                    if found.is_none() {
+                        self.next_scan = Instant::now() + SCAN_EVERY;
+                    }
+                    found
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.searching = None;
+                    self.next_scan = Instant::now() + SCAN_EVERY;
+                    None
+                }
+            };
+        }
+
+        if Instant::now() < self.next_scan {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Dongle::open_wireless(SCAN_FOR).ok());
+        });
+        self.searching = Some(rx);
+        None
+    }
+
+    /// Reopen the link into the handle everything already holds.
     ///
     /// The control socket thread, the status poller and the event tap's
     /// callback each captured a clone of the `Arc` when they started, and none
@@ -210,13 +288,13 @@ impl App {
     /// Quiet when there is nothing to open: a dongle that is still unplugged is
     /// an ordinary state, and this runs every two seconds.
     fn reopen(&mut self) {
+        if self.link.is_none() {
+            return;
+        }
+        let Some(fresh) = self.find_link() else { return };
+        let described = fresh.describe();
+        let wireless = fresh.is_wireless();
         let Some(link) = &self.link else { return };
-        let Ok(path) = Dongle::autodetect() else {
-            return;
-        };
-        let Ok(fresh) = Dongle::open(&path) else {
-            return;
-        };
         let Ok(mut guard) = link.lock() else {
             eprintln!("dongle handle poisoned; cannot reattach");
             return;
@@ -225,7 +303,8 @@ impl App {
         *guard = fresh;
         drop(guard);
         self.link_failed = false;
-        eprintln!("dongle: {path} (reattached)");
+        self.wireless = wireless;
+        eprintln!("dongle: {described} (reattached)");
 
         // The old reader exited when the device vanished, which is what set the
         // failure flag in the first place. Start one on the new device.
@@ -237,13 +316,9 @@ impl App {
 
     /// Open a dongle for the first time and start everything that hangs off it.
     fn open(&mut self) {
-        let Ok(path) = Dongle::autodetect() else {
-            return;
-        };
-        let Ok(dongle) = Dongle::open(&path) else {
-            return;
-        };
-        eprintln!("dongle: {path}");
+        let Some(dongle) = self.find_link() else { return };
+        eprintln!("dongle: {}", dongle.describe());
+        self.wireless = dongle.is_wireless();
         let link = Arc::new(Mutex::new(dongle));
 
         // Started here rather than left to `capture::install`, because the
@@ -279,6 +354,38 @@ impl App {
         // next poll.
         #[cfg(target_os = "macos")]
         self.try_start_capture();
+    }
+
+    /// Ask the dongle to accept a wireless controller for the next minute.
+    ///
+    /// On a worker thread: the request waits on the dongle for up to three
+    /// seconds, and this is called from the event loop that draws the menu.
+    fn open_pairing_window(&self) {
+        let Some(link) = &self.link else { return };
+        let link = Arc::clone(link);
+        let state = Arc::clone(&self.state);
+        std::thread::spawn(move || {
+            let payload = [scurry_proto::wireless_op::PAIR, 60];
+            match state.request(
+                &link,
+                scurry_proto::kind::SET_WIRELESS,
+                &payload,
+                scurry_proto::kind::ACK,
+                Duration::from_secs(3),
+            ) {
+                Ok((_, p))
+                    if p.first().copied() == Some(scurry_proto::ack::OK) =>
+                {
+                    eprintln!(
+                        "pairing window open for 60s -- start a controller with --wireless now"
+                    );
+                }
+                Ok((_, p)) => {
+                    eprintln!("the dongle refused to open the window: {}", ack_message(&p))
+                }
+                Err(e) => eprintln!("could not open the pairing window: {e}"),
+            }
+        });
     }
 
     fn build_menu(&self, snap: &Snapshot) -> Menu {
@@ -317,6 +424,16 @@ impl App {
                     None,
                 ));
 
+                let _ = menu.append(&MenuItem::new(
+                    if self.wireless {
+                        "Connected over Bluetooth"
+                    } else {
+                        "Connected by cable"
+                    },
+                    false,
+                    None,
+                ));
+
                 if !screens.is_empty() {
                     let _ = menu.append(&PredefinedMenuItem::separator());
                     for screen in screens {
@@ -348,6 +465,21 @@ impl App {
             MenuId::new(ID_SETTINGS),
             "Settings…",
             matches!(snap, Snapshot::Ready { .. }),
+            None,
+        ));
+        // Only over the cable. The dongle refuses to change pairing over the
+        // wireless link, because authorising a device that can type on every
+        // machine here should take physical access -- so offering it while
+        // connected over the air would be offering something that cannot work.
+        let attached = matches!(snap, Snapshot::Ready { .. });
+        let _ = menu.append(&MenuItem::with_id(
+            MenuId::new(ID_PAIR),
+            if self.wireless {
+                "Pair a wireless controller (needs the cable)"
+            } else {
+                "Pair a wireless controller…"
+            },
+            attached && !self.wireless,
             None,
         ));
         let _ = menu.append(&CheckMenuItem::with_id(
@@ -398,7 +530,7 @@ impl App {
 
         // login::enabled() reads the filesystem and is part of what the menu
         // shows, so it belongs in the comparison.
-        let state = (snap, login::enabled());
+        let state = (snap, login::enabled(), self.wireless);
         if self.rendered.as_ref() != Some(&state) {
             let menu = self.build_menu(&state.0);
             if let Some(tray) = &self.tray {
@@ -459,6 +591,7 @@ impl ApplicationHandler for App {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             match event.id.as_ref() {
                 ID_SETTINGS => spawn_settings(),
+                ID_PAIR => self.open_pairing_window(),
                 ID_LOGIN => {
                     if let Err(e) = login::toggle() {
                         eprintln!("could not change the login item: {e}");
