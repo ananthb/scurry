@@ -101,14 +101,6 @@ struct ctl_conn {
 };
 static struct ctl_conn conns[SCURRY_MAX_CONTROLLERS];
 
-/* Which of them is driving, or -1. */
-static int active = -1;
-/* Bumped on every change of driver; see the header. */
-static uint32_t generation;
-/* The connection whose request is being handled, so an answer goes back to
- * whoever asked rather than to whoever happens to be driving. */
-static int replying_to = -1;
-
 /* Authorised controllers, whether or not they are here. */
 static esp_bd_addr_t pins[SCURRY_MAX_CONTROLLERS];
 static int pin_count;
@@ -216,8 +208,6 @@ void scurry_ctl_svc_forget(void)
     memset(pins, 0, sizeof(pins));
     pairing_until_us = 0;
     memset(conns, 0, sizeof(conns));
-    active = -1;
-    generation++;
     pins_save();
     ESP_LOGI(TAG, "all wireless controllers forgotten");
 }
@@ -273,49 +263,24 @@ static int conn_slot(uint16_t conn_id, const esp_bd_addr_t bda)
     return -1;
 }
 
-/* Hand the wheel to this controller.
- *
- * Driven by writing, not by connecting or subscribing. That distinction is the
- * whole point: macOS reconnects bonded devices in the background, so a laptop
- * waking in another room would otherwise take control away from the phone in
- * your hand without anybody touching anything. Whoever is actually sending
- * input is the one driving. */
-static void make_active(int slot)
-{
-    if (slot < 0 || active == slot) {
-        return;
-    }
-    if (active >= 0) {
-        const uint8_t *b = conns[slot].bda;
-        ESP_LOGI(TAG, "controller %02x:%02x:%02x:%02x:%02x:%02x took over", b[0], b[1], b[2], b[3],
-                 b[4], b[5]);
-    }
-    active = slot;
-    generation++;
-}
-
-uint32_t scurry_ctl_svc_generation(void)
-{
-    return generation;
-}
-
 void scurry_ctl_svc_init(scurry_ctl_rx_cb_t on_rx)
 {
     rx_cb = on_rx;
     pins_load();
 }
 
-bool scurry_ctl_svc_ready(void)
+bool scurry_ctl_svc_slot_ready(int slot)
 {
-    return active >= 0 && conns[active].used && conns[active].subscribed;
+    return slot >= 0 && slot < SCURRY_MAX_CONTROLLERS && conns[slot].used &&
+           conns[slot].subscribed;
 }
 
-bool scurry_ctl_svc_active_bda(esp_bd_addr_t out)
+bool scurry_ctl_svc_slot_bda(int slot, esp_bd_addr_t out)
 {
-    if (active < 0 || !conns[active].used) {
+    if (slot < 0 || slot >= SCURRY_MAX_CONTROLLERS || !conns[slot].used) {
         return false;
     }
-    memcpy(out, conns[active].bda, sizeof(esp_bd_addr_t));
+    memcpy(out, conns[slot].bda, sizeof(esp_bd_addr_t));
     return true;
 }
 
@@ -325,21 +290,16 @@ void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda)
         if (conns[i].used && same(conns[i].bda, bda)) {
             conns[i].used = false;
             conns[i].subscribed = false;
-            if (active == i) {
-                active = -1;
-                generation++;
-                ESP_LOGI(TAG, "the driving controller disconnected");
-            }
+            ESP_LOGI(TAG, "controller %d disconnected", i);
             return;
         }
     }
 }
 
 /* Send to one connection, splitting at the negotiated MTU. */
-static void notify_slot(int slot, const uint8_t *data, uint16_t len)
+void scurry_ctl_svc_notify_slot(int slot, const uint8_t *data, uint16_t len)
 {
-    if (slot < 0 || !conns[slot].used || !conns[slot].subscribed ||
-        ctl_gatts_if == ESP_GATT_IF_NONE || len == 0) {
+    if (!scurry_ctl_svc_slot_ready(slot) || ctl_gatts_if == ESP_GATT_IF_NONE || len == 0) {
         return;
     }
     uint16_t chunk = ctl_mtu > 3 ? ctl_mtu - 3 : 20;
@@ -354,16 +314,6 @@ static void notify_slot(int slot, const uint8_t *data, uint16_t len)
         esp_ble_gatts_send_indicate(ctl_gatts_if, conns[slot].conn_id,
                                     handles[SCURRY_IDX_EVENT_VAL], n, (uint8_t *)data + off, false);
     }
-}
-
-void scurry_ctl_svc_notify(const uint8_t *data, uint16_t len)
-{
-    notify_slot(active, data, len);
-}
-
-void scurry_ctl_svc_reply(const uint8_t *data, uint16_t len)
-{
-    notify_slot(replying_to >= 0 ? replying_to : active, data, len);
 }
 
 void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -427,24 +377,14 @@ void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                 break;
             }
             conns[slot].subscribed = (param->write.value[0] | (param->write.value[1] << 8)) != 0;
-            /* Subscribing does not take the wheel; writing does. But a lone
-               controller should not have to send input before it can be told
-               anything, so the first one to arrive drives by default. */
-            if (conns[slot].subscribed && active < 0) {
-                make_active(slot);
-            }
             ESP_LOGI(TAG, "controller %s (conn %d)",
                      conns[slot].subscribed ? "subscribed" : "unsubscribed", param->write.conn_id);
             break;
         }
 
-        /* A write is somebody driving. */
-        make_active(slot);
-        replying_to = slot;
         if (rx_cb && param->write.len > 0) {
-            rx_cb(param->write.value, param->write.len);
+            rx_cb(slot, param->write.value, param->write.len);
         }
-        replying_to = -1;
         break;
     }
 

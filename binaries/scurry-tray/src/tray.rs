@@ -56,22 +56,27 @@ enum Attach {
     Hold,
     /// Nothing is attached. Look for a dongle.
     Open,
-    /// A link is held but the device behind it is gone. Reopen the port into
-    /// the handle every consumer already holds.
+    /// A link is held but the device behind it is gone, or a better one has
+    /// turned up. Reopen into the handle every consumer already holds.
     Reopen,
 }
 
-/// Decide from the only two facts that matter, so the rule can be tested
-/// without a dongle to unplug.
+/// Decide from the only facts that matter, so the rule can be tested without a
+/// dongle to unplug.
 ///
 /// The case this exists for: after an unplug the app held a live `Arc` around a
 /// dead fd, so "is something attached?" answered yes forever and the port was
 /// never reopened. Attachment alone is not health.
-fn decide_attach(attached: bool, link_failed: bool) -> Attach {
-    match (attached, link_failed) {
-        (false, _) => Attach::Open,
-        (true, true) => Attach::Reopen,
-        (true, false) => Attach::Hold,
+///
+/// `cable_available` is separate from health because a working wireless link is
+/// not a reason to ignore a cable that has just been plugged in. The cable is
+/// fifty times faster, so a healthy link is not necessarily the right one.
+fn decide_attach(attached: bool, link_failed: bool, cable_available: bool) -> Attach {
+    match (attached, link_failed, cable_available) {
+        (false, _, _) => Attach::Open,
+        (true, true, _) => Attach::Reopen,
+        (true, false, true) => Attach::Reopen,
+        (true, false, false) => Attach::Hold,
     }
 }
 
@@ -203,7 +208,12 @@ impl App {
         // pointless reopen later.
         self.link_failed |= scurry_ctl::capture::take_link_failure();
 
-        match decide_attach(self.link.is_some(), self.link_failed) {
+        // Only interesting while on the radio: on the cable already, or with
+        // nothing attached, the answer changes nothing and probing the serial
+        // ports every two seconds would be pure noise.
+        let cable_available = self.wireless && Dongle::autodetect().is_ok();
+
+        match decide_attach(self.link.is_some(), self.link_failed, cable_available) {
             Attach::Hold => {}
             Attach::Reopen => {
                 self.reopen();
@@ -292,6 +302,13 @@ impl App {
             return;
         }
         let Some(fresh) = self.find_link() else { return };
+
+        // The reader holds its own clone, so swapping what is inside the mutex
+        // would not reach it: it would go on reading the link being replaced.
+        // A reader whose device vanished has already exited and this is a
+        // no-op; one being replaced deliberately has not.
+        scurry_ctl::capture::stop_reader();
+
         let described = fresh.describe();
         let wireless = fresh.is_wireless();
         let Some(link) = &self.link else { return };
@@ -640,15 +657,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cable_appearing_beats_a_healthy_wireless_link() {
+        // The whole point of the fourth argument: 0.3ms is available and the
+        // app is using 17ms. Health is not the same as being the right link.
+        assert!(matches!(decide_attach(true, false, true), Attach::Reopen));
+    }
+
+    #[test]
+    fn a_healthy_link_with_no_cable_is_left_alone() {
+        assert!(matches!(decide_attach(true, false, false), Attach::Hold));
+    }
+
+    #[test]
     fn nothing_attached_looks_for_a_dongle() {
-        assert_eq!(decide_attach(false, false), Attach::Open);
+        assert_eq!(decide_attach(false, false, false), Attach::Open);
     }
 
     #[test]
     fn a_healthy_link_is_left_alone() {
         // Reopening a working port on every poll would drop the fd the control
         // socket and the tap are using, twice a second.
-        assert_eq!(decide_attach(true, false), Attach::Hold);
+        assert_eq!(decide_attach(true, false, false), Attach::Hold);
     }
 
     #[test]
@@ -656,13 +685,13 @@ mod tests {
         // The bug: unplug and replug left a live Arc around a dead fd, the
         // "already attached" check passed forever, and the app never held a
         // descriptor on the device again.
-        assert_eq!(decide_attach(true, true), Attach::Reopen);
+        assert_eq!(decide_attach(true, true, false), Attach::Reopen);
     }
 
     #[test]
     fn a_failure_without_a_link_still_opens_from_scratch() {
         // A failure latched from a link that was never replaced must not stop
         // the ordinary first-attach path from running.
-        assert_eq!(decide_attach(false, true), Attach::Open);
+        assert_eq!(decide_attach(false, true, false), Attach::Open);
     }
 }

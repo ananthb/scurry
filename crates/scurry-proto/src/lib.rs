@@ -497,8 +497,14 @@ pub const MAX_CONTROLLERS: usize = 4;
 /// [`kind::WIRELESS`] payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WirelessState {
-    /// A controller is connected, subscribed, and driving right now.
-    pub ready: bool,
+    /// A wireless controller currently has the wheel.
+    pub wireless_driving: bool,
+    /// The cable has it. Both false means nobody has sent input yet.
+    ///
+    /// Two flags rather than one, because "no wireless controller is driving"
+    /// and "the cable is driving" are different states and the difference is
+    /// what a person wants to see.
+    pub cable_driving: bool,
     /// Which one is driving; all zero when none is.
     pub active: [u8; 6],
     /// Seconds left in the pairing window, 0 when closed.
@@ -512,7 +518,8 @@ pub struct WirelessState {
 impl Default for WirelessState {
     fn default() -> Self {
         Self {
-            ready: false,
+            wireless_driving: false,
+            cable_driving: false,
             active: [0u8; 6],
             window_secs: 0,
             count: 0,
@@ -547,7 +554,7 @@ impl WirelessState {
             return None;
         }
         out[..need].fill(0);
-        out[0] = u8::from(self.ready);
+        out[0] = u8::from(self.wireless_driving) | (u8::from(self.cable_driving) << 1);
         out[1..7].copy_from_slice(&self.active);
         out[7] = self.window_secs;
         out[8] = n as u8;
@@ -573,7 +580,8 @@ impl WirelessState {
             slot.copy_from_slice(&b[off..off + 6]);
         }
         Some(Self {
-            ready: b[0] != 0,
+            wireless_driving: b[0] & 0x01 != 0,
+            cable_driving: b[0] & 0x02 != 0,
             active,
             window_secs: b[7],
             count: count as u8,
@@ -777,7 +785,7 @@ mod tests {
     #[test]
     fn wireless_state_roundtrips() {
         let mut w = WirelessState {
-            ready: true,
+            wireless_driving: true,
             active: [0x84, 0x2f, 0x57, 0x29, 0x63, 0x64],
             window_secs: 42,
             count: 2,
@@ -794,6 +802,22 @@ mod tests {
         assert_eq!(got.controllers().len(), 2);
         assert!(got.is_active(&[0x84, 0x2f, 0x57, 0x29, 0x63, 0x64]));
         assert!(!got.is_active(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+    }
+
+    #[test]
+    fn the_cable_driving_is_distinct_from_nobody_driving() {
+        // One flag could not tell them apart, and they are what a person is
+        // actually asking about.
+        let cable = WirelessState { cable_driving: true, ..Default::default() };
+        let mut buf = [0u8; 16];
+        let n = cable.encode_into(&mut buf).unwrap();
+        let got = WirelessState::decode(&buf[..n]).unwrap();
+        assert!(got.cable_driving && !got.wireless_driving);
+
+        let idle = WirelessState::default();
+        let n = idle.encode_into(&mut buf).unwrap();
+        let got = WirelessState::decode(&buf[..n]).unwrap();
+        assert!(!got.cable_driving && !got.wireless_driving);
     }
 
     #[test]

@@ -28,11 +28,16 @@
  * and re-paired to get it back afterwards. Exactly one drives at a time. */
 #define SCURRY_MAX_CONTROLLERS 4
 
-/* Handed every byte the driving controller writes. The bytes are a stream, not
- * a message: BLE writes are bounded by the negotiated MTU and a config payload
- * is larger than any MTU a host will agree to, so a frame routinely arrives in
- * pieces. The caller reassembles. */
-typedef void (*scurry_ctl_rx_cb_t)(const uint8_t *data, uint16_t len);
+/* Handed every byte a controller writes, with the slot it came from. The bytes
+ * are a stream, not a message: BLE writes are bounded by the negotiated MTU and
+ * a config payload is larger than any MTU a host will agree to, so a frame
+ * routinely arrives in pieces. The caller reassembles, per slot -- two
+ * controllers writing at once are two streams, and reassembling them into one
+ * buffer would produce frames neither of them sent.
+ *
+ * Which of them is allowed to move the pointer is decided above this layer,
+ * where the cable is visible too. */
+typedef void (*scurry_ctl_rx_cb_t)(int slot, const uint8_t *data, uint16_t len);
 
 void scurry_ctl_svc_init(scurry_ctl_rx_cb_t on_rx);
 
@@ -41,32 +46,16 @@ void scurry_ctl_svc_init(scurry_ctl_rx_cb_t on_rx);
 void scurry_ctl_svc_gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                                 esp_ble_gatts_cb_param_t *param);
 
-/* True once a controller is connected, subscribed and driving. */
-bool scurry_ctl_svc_ready(void);
+/* Send to one controller. Silently does nothing if that slot is not connected
+ * and subscribed, which is the ordinary state on the cable. */
+void scurry_ctl_svc_notify_slot(int slot, const uint8_t *data, uint16_t len);
 
-/* Send an announcement to whichever controller is driving. Silently does
- * nothing when none is, which is the ordinary state on the cable. */
-void scurry_ctl_svc_notify(const uint8_t *data, uint16_t len);
+/* Whether a slot holds a subscribed controller, and who it is. */
+bool scurry_ctl_svc_slot_ready(int slot);
+bool scurry_ctl_svc_slot_bda(int slot, esp_bd_addr_t out);
 
-/* Send an answer to the controller whose request is being handled.
- *
- * Distinct from notify. A controller that is connected but not driving must
- * still get answers to its own queries, or opening the settings window on the
- * machine that is not currently in charge would silently time out. */
-void scurry_ctl_svc_reply(const uint8_t *data, uint16_t len);
-
-/* Bumped whenever the driving controller changes.
- *
- * The reader compares it to decide whether the bytes it is holding still belong
- * to the same stream: a half-delivered frame from the previous controller must
- * not have the next one's first bytes spliced onto it. */
-uint32_t scurry_ctl_svc_generation(void);
-
-/* Which controller is driving, if any. */
-bool scurry_ctl_svc_active_bda(esp_bd_addr_t out);
-
-/* True if this address is authorised at all, driving or not -- so no controller
- * is ever seated as a target, even while another one holds the wheel. */
+/* True if this address is authorised at all -- so no controller is ever seated
+ * as a target, even while another one holds the wheel. */
 bool scurry_ctl_svc_is_pinned(const esp_bd_addr_t bda);
 
 void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda);

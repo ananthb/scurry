@@ -40,6 +40,16 @@ fn apply_focus(_node: u8) {}
 /// True while a thread is draining the dongle.
 static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Asks the reader to come home.
+///
+/// The reader's only exit used to be a read failure, which is right for a
+/// device that vanished and wrong for a link being deliberately replaced --
+/// swapping the `Dongle` inside the mutex does not reach the reader, because it
+/// holds its own clone. Without this, switching from the radio to the cable
+/// would leave the reader on the radio while everything else talked over the
+/// cable.
+static READER_STOP: AtomicBool = AtomicBool::new(false);
+
 /// Set when a reader stops because the link failed, and cleared by
 /// [`take_link_failure`].
 ///
@@ -79,6 +89,23 @@ pub fn take_link_failure() -> bool {
 /// `read()` on the same fd with each frame's bytes split between them, which
 /// corrupted FOCUS announcements and stole the replies to config and status
 /// queries.
+/// Stop the reader and wait for it to let go of its handle.
+///
+/// Bounded, because a reader wedged in a driver call must not wedge the caller
+/// too -- the menu is drawn on that thread. It waits a little over one read
+/// timeout, which is all a healthy reader needs.
+pub fn stop_reader() {
+    if !READER_RUNNING.load(Ordering::SeqCst) {
+        return;
+    }
+    READER_STOP.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+    while READER_RUNNING.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    READER_STOP.store(false, Ordering::SeqCst);
+}
+
 pub fn watch(dongle: &Arc<Mutex<Dongle>>, state: &Arc<DaemonState>) -> Result<()> {
     if READER_RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -98,8 +125,12 @@ pub fn watch(dongle: &Arc<Mutex<Dongle>>, state: &Arc<DaemonState>) -> Result<()
     let state = Arc::clone(state);
     std::thread::spawn(move || {
         let mut on_log = |line: &str| eprintln!("[dongle] {line}");
-        // The only way out is a read failure; there is no orderly shutdown.
+        let mut asked_to_stop = false;
         loop {
+            if READER_STOP.load(Ordering::SeqCst) {
+                asked_to_stop = true;
+                break;
+            }
             match reader.recv(Duration::from_millis(200), &mut on_log) {
                 Ok(Some(msg)) if msg.kind == kind::FOCUS => {
                     if let Some(&node) = msg.payload.first() {
@@ -130,7 +161,13 @@ pub fn watch(dongle: &Arc<Mutex<Dongle>>, state: &Arc<DaemonState>) -> Result<()
         // looks frozen with no pointer and no way to click anything.
         apply_focus(0);
         state.focus.store(0, Ordering::Relaxed);
-        LINK_FAILED.store(true, Ordering::SeqCst);
+
+        // Only a link that broke is a failure. One that was asked to stop is
+        // about to be replaced by the caller, and announcing a failure would
+        // send it round the reattach path it is already in the middle of.
+        if !asked_to_stop {
+            LINK_FAILED.store(true, Ordering::SeqCst);
+        }
     });
     Ok(())
 }

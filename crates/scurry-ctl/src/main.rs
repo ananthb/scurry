@@ -329,7 +329,7 @@ fn wireless() -> Result<()> {
             // Driving is not the same as connected: several may be connected
             // at once and exactly one sends input.
             let state = if w.is_active(bda) {
-                if w.ready { "driving" } else { "connected" }
+                if w.wireless_driving { "driving" } else { "connected" }
             } else {
                 "authorised"
             };
@@ -337,6 +337,9 @@ fn wireless() -> Result<()> {
         }
     }
 
+    if w.cable_driving {
+        println!("\ninput is coming from the cable");
+    }
     if w.window_secs > 0 {
         println!("\npairing window open, {}s left", w.window_secs);
     } else if w.controllers().is_empty() {

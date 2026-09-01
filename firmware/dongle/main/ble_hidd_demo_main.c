@@ -79,6 +79,10 @@ static bool          scurry_conn_used[SCURRY_MAX_HOSTS];
    and it has to be stored on connect to be usable on disconnect. */
 static esp_bd_addr_t scurry_conn_bda[SCURRY_MAX_HOSTS];
 
+/* Defined with the source model further down; called from the connection
+   callbacks, which appear well before it. */
+static void scurry_controller_gone(const esp_bd_addr_t bda);
+
 static int scurry_conn_count(void)
 {
     int n = 0;
@@ -284,6 +288,7 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
             sec_conn = false;
             ESP_LOGI(HID_DEMO_TAG, "ESP_HIDD_EVENT_BLE_DISCONNECT");
             scurry_conn_remove(param->disconnect.remote_bda);
+            scurry_controller_gone(param->disconnect.remote_bda);
             scurry_ctl_svc_on_disconnect(param->disconnect.remote_bda);
             if (scurry_total_conns > 0) {
                 scurry_total_conns--;
@@ -390,12 +395,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_NVS_NAMESPACE  "scurry"
 #define SCURRY_NVS_KEY_LAYOUT "layout"
 
-/* Where an outbound frame goes. Announcements go everywhere; a reply goes back
-   the way its request arrived, so a query over the cable is not answered into
-   the air and vice versa. */
-#define SCURRY_TO_USB 0x01
-#define SCURRY_TO_BLE 0x02
-static uint8_t scurry_reply_to = SCURRY_TO_USB;
+/* The source whose request is being answered, so a query over the cable is not
+   answered into the air, and a query from one controller is not answered to
+   another. */
+static int scurry_reply_src = 0;
 
 static uint16_t scurry_tx_seq = 0;
 static uint8_t  scurry_focus_node = 0;
@@ -406,9 +409,57 @@ static int64_t  scurry_focus_sent_us = 0;
    the repeat costs well under a thousandth of the link. */
 #define SCURRY_FOCUS_REPEAT_US 500000
 
-static bool     scurry_seq_seen = false;
-static uint16_t scurry_seq_last = 0;
-static uint8_t  scurry_seq_rejected = 0;
+/* Where a frame came from.
+ *
+ * The cable is one source and each connected controller is another. They are
+ * genuinely independent streams: separate sequence numbering, separate
+ * reassembly. Sharing either was a bug -- one sequence gate across two
+ * controllers means each one's frames look like ancient stragglers to the
+ * other, and the resync logic thrashes instead of either working. */
+#define SCURRY_SRC_USB 0
+#define SCURRY_SRC_BLE(slot) (1 + (slot))
+#define SCURRY_SRC_COUNT (1 + SCURRY_MAX_CONTROLLERS)
+
+typedef struct {
+    bool seen;
+    uint16_t last;
+    uint8_t rejected;
+} scurry_seq_t;
+static scurry_seq_t scurry_seq[SCURRY_SRC_COUNT];
+
+/* Which source may move the pointer, or -1 when nobody has yet.
+ *
+ * Authorisation says who *may* drive; this says who *is*. Without it every
+ * authorised controller drives at once -- a laptop on the cable and a phone on
+ * the radio would both feed the same layout and fight over the pointer. */
+static int scurry_driver = -1;
+static int64_t scurry_driver_last_us;
+
+/* How long the driver must be quiet before another source may take over.
+ *
+ * Zero would flap: two sources sending at once would swap the wheel on every
+ * frame. Long enough to require a deliberate pause, short enough that picking
+ * up the other device feels immediate -- and it only applies when two sources
+ * are genuinely active at the same time, which is the case worth being
+ * conservative about. */
+#define SCURRY_HANDOVER_QUIET_US 250000
+
+/* Whether this source may move the pointer, and record that it just did. */
+static bool scurry_claim(int src)
+{
+    int64_t now = esp_timer_get_time();
+    if (scurry_driver == src) {
+        scurry_driver_last_us = now;
+        return true;
+    }
+    if (scurry_driver >= 0 && (now - scurry_driver_last_us) < SCURRY_HANDOVER_QUIET_US) {
+        return false; /* somebody else is actively driving */
+    }
+    ESP_LOGI(HID_DEMO_TAG, "scurry: input now from source %d", src);
+    scurry_driver = src;
+    scurry_driver_last_us = now;
+    return true;
+}
 
 /* Consecutive rejections after which the gate re-anchors. A restarted
    controller counts from zero again while we still remember a high sequence
@@ -421,26 +472,27 @@ static uint8_t  scurry_seq_rejected = 0;
 /* Sequence numbers wrap at u16, so "newer" is signed distance on the wrapped
    circle, not `>`. A naive comparison would stall the stream for 32k messages
    every time the counter wrapped. Mirrors SeqGate in scurry-proto. */
-static bool scurry_seq_accept(uint16_t seq)
+static bool scurry_seq_accept(int src, uint16_t seq)
 {
-    if (!scurry_seq_seen) {
-        scurry_seq_seen = true;
-        scurry_seq_last = seq;
-        scurry_seq_rejected = 0;
+    scurry_seq_t *g = &scurry_seq[src];
+    if (!g->seen) {
+        g->seen = true;
+        g->last = seq;
+        g->rejected = 0;
         return true;
     }
-    if ((int16_t)(seq - scurry_seq_last) > 0) {
-        scurry_seq_last = seq;
-        scurry_seq_rejected = 0;
+    if ((int16_t)(seq - g->last) > 0) {
+        g->last = seq;
+        g->rejected = 0;
         return true;
     }
-    if (scurry_seq_rejected >= SCURRY_SEQ_RESYNC_AFTER) {
-        ESP_LOGW(HID_DEMO_TAG, "scurry: controller restarted, re-anchoring at seq %u", seq);
-        scurry_seq_last = seq;
-        scurry_seq_rejected = 0;
+    if (g->rejected >= SCURRY_SEQ_RESYNC_AFTER) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: source %d restarted, re-anchoring at seq %u", src, seq);
+        g->last = seq;
+        g->rejected = 0;
         return true;
     }
-    scurry_seq_rejected++;
+    g->rejected++;
     return false;
 }
 
@@ -448,12 +500,8 @@ static bool scurry_seq_accept(uint16_t seq)
    frame does not have to live on its stack. */
 static uint8_t scurry_tx_buf[SCURRY_HEADER_LEN + SCURRY_MAX_PAYLOAD];
 
-static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint16_t len,
-                        bool is_reply)
+static void scurry_frame(uint8_t kind, const uint8_t *payload, uint16_t len, uint16_t *out_total)
 {
-    if (len > SCURRY_MAX_PAYLOAD) {
-        return;
-    }
     uint8_t *h = scurry_tx_buf;
     memset(h, 0, SCURRY_HEADER_LEN);
     h[0] = SCURRY_MAGIC;
@@ -467,40 +515,50 @@ static void scurry_emit(uint8_t dest, uint8_t kind, const uint8_t *payload, uint
     if (len > 0 && payload != NULL) {
         memcpy(h + SCURRY_HEADER_LEN, payload, len);
     }
-    uint16_t total = SCURRY_HEADER_LEN + len;
-
-    if (dest & SCURRY_TO_USB) {
-        /* 20ms, not 100: with the dongle on a wall wart and no host draining
-           the port, every write would otherwise stall the reader task for a
-           tenth of a second. Dropping the frame is safe now that focus is
-           re-announced rather than sent once. */
-        usb_serial_jtag_write_bytes(h, total, 20 / portTICK_PERIOD_MS);
-    }
-    if (dest & SCURRY_TO_BLE) {
-        /* An answer goes back to whoever asked; an announcement goes to
-           whoever is driving. With more than one controller authorised those
-           are not always the same connection, and a settings window opened on
-           the machine that is not currently in charge would otherwise wait for
-           a reply delivered to somebody else. */
-        if (is_reply) {
-            scurry_ctl_svc_reply(h, total);
-        } else {
-            scurry_ctl_svc_notify(h, total);
-        }
-    }
+    *out_total = SCURRY_HEADER_LEN + len;
 }
 
-/* An announcement: both transports, because either may be carrying a
-   controller that needs to hear it. */
-static void scurry_send(uint8_t kind, const uint8_t *payload, uint16_t len)
+static void scurry_write_usb(const uint8_t *buf, uint16_t total)
 {
-    scurry_emit(SCURRY_TO_USB | SCURRY_TO_BLE, kind, payload, len, false);
+    /* 20ms, not 100: with the dongle on a wall wart and no host draining the
+       port, every write would otherwise stall the reader task for a tenth of a
+       second. Dropping the frame is safe now that focus is re-announced rather
+       than sent once. */
+    usb_serial_jtag_write_bytes(buf, total, 20 / portTICK_PERIOD_MS);
 }
 
-/* An answer: back to whoever asked. */
+/* An answer, to whoever asked. */
 static void scurry_reply(uint8_t kind, const uint8_t *payload, uint16_t len)
 {
-    scurry_emit(scurry_reply_to, kind, payload, len, true);
+    if (len > SCURRY_MAX_PAYLOAD) {
+        return;
+    }
+    uint16_t total = 0;
+    scurry_frame(kind, payload, len, &total);
+    if (scurry_reply_src == SCURRY_SRC_USB) {
+        scurry_write_usb(scurry_tx_buf, total);
+    } else {
+        scurry_ctl_svc_notify_slot(scurry_reply_src - 1, scurry_tx_buf, total);
+    }
+}
+
+/* An announcement, to everyone who could act on it.
+ *
+ * Not only to the driver. A controller that is connected but not driving may
+ * take the wheel at any moment, and it would take it believing the pointer is
+ * wherever it was when it last heard -- which is how both cursors end up moving
+ * at once. Nine bytes to every subscriber is cheaper than that bug. */
+static void scurry_send(uint8_t kind, const uint8_t *payload, uint16_t len)
+{
+    if (len > SCURRY_MAX_PAYLOAD) {
+        return;
+    }
+    uint16_t total = 0;
+    scurry_frame(kind, payload, len, &total);
+    scurry_write_usb(scurry_tx_buf, total);
+    for (int i = 0; i < SCURRY_MAX_CONTROLLERS; i++) {
+        scurry_ctl_svc_notify_slot(i, scurry_tx_buf, total);
+    }
 }
 
 static void scurry_send_ack(uint8_t code)
@@ -899,9 +957,17 @@ static void scurry_send_wireless(void)
     /* Nine bytes of header, then one address per authorised controller. */
     uint8_t buf[9 + SCURRY_MAX_CONTROLLERS * 6] = {0};
     esp_bd_addr_t bda;
-    buf[0] = scurry_ctl_svc_ready() ? 1 : 0;
-    if (scurry_ctl_svc_active_bda(bda)) {
-        memcpy(&buf[1], bda, 6);
+    /* Bit 0: a wireless controller has the wheel. Bit 1: the cable does. */
+    if (scurry_driver == SCURRY_SRC_USB) {
+        buf[0] = 0x02;
+    } else if (scurry_driver > 0) {
+        int slot = scurry_driver - 1;
+        if (scurry_ctl_svc_slot_ready(slot)) {
+            buf[0] = 0x01;
+        }
+        if (scurry_ctl_svc_slot_bda(slot, bda)) {
+            memcpy(&buf[1], bda, 6);
+        }
     }
     uint32_t left = scurry_ctl_svc_pairing_remaining();
     buf[7] = left > 255 ? 255 : (uint8_t)left;
@@ -927,7 +993,7 @@ static void scurry_handle_set_wireless(const uint8_t *p, uint16_t len)
         scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
         return;
     }
-    if (scurry_reply_to != SCURRY_TO_USB) {
+    if (scurry_reply_src != SCURRY_SRC_USB) {
         ESP_LOGW(HID_DEMO_TAG, "scurry: refusing to change pairing over the wireless link");
         scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
         return;
@@ -950,21 +1016,26 @@ static void scurry_handle_set_wireless(const uint8_t *p, uint16_t len)
 }
 
 static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, uint16_t len,
-                          uint8_t via)
+                          int src)
 {
-    scurry_reply_to = via;
+    scurry_reply_src = src;
 
-    /* Only the pointer stream is sequence-gated. Control messages are rare and
+    /* Input is gated on being the driver; queries are not. Anyone authorised
+       may ask what the layout is or push a new one -- only one of them may move
+       the pointer, or a laptop on the cable and a phone on the radio would both
+       feed the same layout and fight over it.
+
+       Only the pointer stream is sequence-gated. Control messages are rare and
        must not be dropped for arriving out of order behind a burst of motion. */
     if (kind == SCURRY_KIND_MOUSE) {
-        if (!scurry_seq_accept(seq)) {
+        if (!scurry_claim(src) || !scurry_seq_accept(src, seq)) {
             return;
         }
         scurry_handle_mouse(payload, len);
         return;
     }
     if (kind == SCURRY_KIND_KEY) {
-        if (!scurry_seq_accept(seq)) {
+        if (!scurry_claim(src) || !scurry_seq_accept(src, seq)) {
             return;
         }
         scurry_handle_key(payload, len);
@@ -1009,7 +1080,7 @@ typedef struct {
     size_t filled;
 } scurry_framer_t;
 
-static void scurry_framer_feed(scurry_framer_t *f, const uint8_t *data, size_t len, uint8_t via)
+static void scurry_framer_feed(scurry_framer_t *f, const uint8_t *data, size_t len, int src)
 {
     while (len > 0) {
         size_t room = sizeof(f->buf) - f->filled;
@@ -1043,7 +1114,7 @@ static void scurry_framer_feed(scurry_framer_t *f, const uint8_t *data, size_t l
                 break; /* payload still in flight */
             }
             uint16_t seq = (uint16_t)h[4] | ((uint16_t)h[5] << 8);
-            scurry_handle(h[2], seq, h + SCURRY_HEADER_LEN, flen, via);
+            scurry_handle(h[2], seq, h + SCURRY_HEADER_LEN, flen, src);
             off += SCURRY_HEADER_LEN + flen;
         }
 
@@ -1054,10 +1125,30 @@ static void scurry_framer_feed(scurry_framer_t *f, const uint8_t *data, size_t l
     }
 }
 
-static scurry_framer_t scurry_usb_framer;
-static scurry_framer_t scurry_ble_framer;
-/* The driver the BLE framer's held bytes belong to. */
-static uint32_t scurry_ble_generation;
+/* One per source. Two controllers writing at once are two byte streams, and
+   reassembling them into one buffer would splice a frame out of halves neither
+   of them sent. */
+static scurry_framer_t scurry_framers[SCURRY_SRC_COUNT];
+
+/* A controller has gone. Release the wheel and forget its stream.
+ *
+ * Holding either would punish whoever comes next: the replacement would wait
+ * out the handover delay for nothing, and its first frames would be rejected as
+ * stragglers behind a departed peer's sequence numbers. */
+static void scurry_controller_gone(const esp_bd_addr_t bda)
+{
+    for (int i = 0; i < SCURRY_MAX_CONTROLLERS; i++) {
+        esp_bd_addr_t held;
+        if (scurry_ctl_svc_slot_bda(i, held) && memcmp(held, bda, sizeof(esp_bd_addr_t)) == 0) {
+            if (scurry_driver == SCURRY_SRC_BLE(i)) {
+                scurry_driver = -1;
+            }
+            scurry_seq[SCURRY_SRC_BLE(i)].seen = false;
+            scurry_framers[SCURRY_SRC_BLE(i)].filled = 0;
+            return;
+        }
+    }
+}
 
 /* Bytes the wireless controller has written, waiting for the reader task.
  *
@@ -1067,16 +1158,24 @@ static uint32_t scurry_ble_generation;
  * the reader task on every mouse message -- and on the shared transmit buffer
  * and sequence counter. So the callback only hands the bytes over, and every
  * frame from either transport is still parsed and acted on by one task. */
+/* The largest single GATT write the control characteristic accepts. */
+#define CTL_RX_MAX 244
 static RingbufHandle_t scurry_ble_rb;
 
-static void scurry_ble_rx(const uint8_t *data, uint16_t len)
+static void scurry_ble_rx(int slot, const uint8_t *data, uint16_t len)
 {
-    if (scurry_ble_rb == NULL) {
+    if (scurry_ble_rb == NULL || len == 0 || len > CTL_RX_MAX) {
         return;
     }
+    /* The slot travels with the bytes. A byte-buffer ring would run adjacent
+       writes together and lose that boundary, so the ring holds discrete items
+       and each carries its own one-byte header. */
+    uint8_t item[1 + CTL_RX_MAX];
+    item[0] = (uint8_t)slot;
+    memcpy(&item[1], data, len);
     /* No wait: the pointer stream must not block the Bluetooth task, and a
        dropped mouse frame is repaired by the next one. */
-    if (xRingbufferSend(scurry_ble_rb, data, len, 0) != pdTRUE) {
+    if (xRingbufferSend(scurry_ble_rb, item, len + 1, 0) != pdTRUE) {
         static uint32_t dropped = 0;
         if ((dropped++ % 100) == 0) {
             ESP_LOGW(HID_DEMO_TAG, "scurry: wireless receive buffer full, dropping");
@@ -1107,32 +1206,29 @@ void scurry_reader_task(void *pvParameters)
         TickType_t wait = pdMS_TO_TICKS(10);
         int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), wait > 0 ? wait : 1);
         if (n > 0) {
-            scurry_framer_feed(&scurry_usb_framer, chunk, (size_t)n, SCURRY_TO_USB);
+            scurry_framer_feed(&scurry_framers[SCURRY_SRC_USB], chunk, (size_t)n,
+                               SCURRY_SRC_USB);
         }
 
         if (scurry_ble_rb != NULL) {
             size_t got = 0;
             uint8_t *item = (uint8_t *)xRingbufferReceive(scurry_ble_rb, &got, 0);
             if (item != NULL) {
-                /* A controller that has identified itself must not also hold a
-                   target slot: it connected as an ordinary central and was
-                   seated as one before it said what it was. Idempotent, so this
-                   costs four memcmps once and nothing after. */
-                esp_bd_addr_t bda;
-                if (scurry_ctl_svc_active_bda(bda)) {
-                    scurry_conn_remove(bda);
+                if (got >= 2) {
+                    int slot = item[0];
+                    if (slot >= 0 && slot < SCURRY_MAX_CONTROLLERS) {
+                        /* A controller must not also hold a target slot: it
+                           connected as an ordinary central and was seated as
+                           one before it said what it was. Idempotent, so this
+                           costs a few memcmps once and nothing after. */
+                        esp_bd_addr_t bda;
+                        if (scurry_ctl_svc_slot_bda(slot, bda)) {
+                            scurry_conn_remove(bda);
+                        }
+                        scurry_framer_feed(&scurry_framers[SCURRY_SRC_BLE(slot)], item + 1,
+                                           got - 1, SCURRY_SRC_BLE(slot));
+                    }
                 }
-                /* A different controller is driving than when the buffer last
-                   had bytes in it. Whatever partial frame is held belongs to
-                   the previous one, and splicing the next controller's first
-                   bytes onto its tail would produce a frame neither of them
-                   sent. */
-                uint32_t gen = scurry_ctl_svc_generation();
-                if (gen != scurry_ble_generation) {
-                    scurry_ble_generation = gen;
-                    scurry_ble_framer.filled = 0;
-                }
-                scurry_framer_feed(&scurry_ble_framer, item, got, SCURRY_TO_BLE);
                 vRingbufferReturnItem(scurry_ble_rb, item);
             }
         }
@@ -1202,7 +1298,7 @@ void app_main(void)
        After esp_hidd_register_callbacks, not before: that is what installs the
        GATTS callback, and an app registered ahead of it has its registration
        event delivered to nobody -- the service then silently never exists. */
-    scurry_ble_rb = xRingbufferCreate(1024, RINGBUF_TYPE_BYTEBUF);
+    scurry_ble_rb = xRingbufferCreate(2048, RINGBUF_TYPE_NOSPLIT);
     if (scurry_ble_rb == NULL) {
         ESP_LOGE(HID_DEMO_TAG, "scurry: no memory for the wireless receive buffer");
     }
