@@ -24,8 +24,6 @@ typedef struct {
        absolute HID coordinate. Relative motion would require dead reckoning,
        which breaks as soon as anything else moves the remote pointer or the
        target applies its own acceleration to our deltas. */
-    uint16_t abs_x;
-    uint16_t abs_y;
 } scurry_route_t;
 
 /* Install a layout from a CONFIG payload (count byte, then that many screens).

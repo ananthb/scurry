@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -21,15 +21,6 @@ use anyhow::{Context, Result};
 use scurry_proto::{ack, kind, Header, HEADER_LEN, MAGIC, MAX_PAYLOAD, VERSION};
 
 use crate::transport::Dongle;
-
-/// Daemon-local message kinds, above the dongle's range so a forwarded request
-/// can never be confused with one the daemon answers itself.
-pub mod local {
-    /// Tray -> daemon: which node holds the pointer, and is the link up.
-    pub const GET_DAEMON_STATUS: u8 = 0x40;
-    /// Daemon -> tray: `[focus_node, link_ok]`.
-    pub const DAEMON_STATUS: u8 = 0x41;
-}
 
 /// Where the socket lives.
 ///
@@ -317,26 +308,17 @@ fn handle(
         stream.read_exact(&mut payload).context("reading request payload")?;
     }
 
-    match h.kind {
-        local::GET_DAEMON_STATUS => {
-            let body = [state.focus.load(Ordering::Relaxed), 1];
-            reply(&mut stream, local::DAEMON_STATUS, &body)?;
-            Ok(Served::More)
-        }
-        // Anything else is for the dongle. Forward it and relay the answer.
-        _ => {
-            let want = match h.kind {
-                kind::GET_CONFIG => kind::CONFIG,
-                kind::GET_STATUS => kind::STATUS,
-                kind::GET_WIRELESS => kind::WIRELESS,
-                kind::PING => kind::PONG,
-                _ => kind::ACK,
-            };
-            let (k, p) = state.request(dongle, h.kind, &payload, want, Duration::from_secs(3))?;
-            reply(&mut stream, k, &p)?;
-            Ok(Served::More)
-        }
-    }
+    // Every request is for the dongle. Forward it and relay the answer.
+    let want = match h.kind {
+        kind::GET_CONFIG => kind::CONFIG,
+        kind::GET_STATUS => kind::STATUS,
+        kind::GET_WIRELESS => kind::WIRELESS,
+        kind::PING => kind::PONG,
+        _ => kind::ACK,
+    };
+    let (k, p) = state.request(dongle, h.kind, &payload, want, Duration::from_secs(3))?;
+    reply(&mut stream, k, &p)?;
+    Ok(Served::More)
 }
 
 fn reply(stream: &mut &UnixStream, kind: u8, payload: &[u8]) -> Result<()> {

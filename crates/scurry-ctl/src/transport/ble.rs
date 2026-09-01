@@ -35,8 +35,10 @@ use uuid::Uuid;
 use super::{encode, Framer, Message};
 
 /// 73637572-7279-4c49-4e4b-0000000000xx -- "scurry" and "LINK" in ASCII. Must
-/// match the service the firmware publishes.
-pub const SERVICE: Uuid = Uuid::from_u128(0x73637572_7279_4c49_4e4b_000000000001);
+/// match the characteristics the firmware publishes.
+///
+/// The service's own UUID is not here: finding both characteristics is the
+/// check that matters, and it gives a better answer when they are missing.
 pub const CONTROL: Uuid = Uuid::from_u128(0x73637572_7279_4c49_4e4b_000000000002);
 pub const EVENT: Uuid = Uuid::from_u128(0x73637572_7279_4c49_4e4b_000000000003);
 
