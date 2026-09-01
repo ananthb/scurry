@@ -223,12 +223,26 @@ pub fn serve(dongle: Arc<Mutex<Dongle>>, state: Arc<DaemonState>) -> Result<()> 
             // temporarily unavailable", which says nothing about what went
             // wrong. Answer with a refusal instead, so the caller gets a
             // reason.
-            if let Err(e) = handle(&stream, &dongle, &state) {
-                eprintln!("control socket client: {e}");
-                let mut s = &stream;
-                // Alternate form, so the client is told the whole chain rather
-                // than just the outermost "reading request payload".
-                let _ = reply(&mut s, kind::ACK, &refusal(&format!("{e:#}")));
+            // Until the client hangs up, not once: a caller that reuses its
+            // connection for a second request used to get a broken pipe,
+            // because the handler answered one and returned. Anything that
+            // wants to ask repeatedly -- a latency probe, a poller that does
+            // not want a fresh socket per tick -- needs the connection to
+            // outlive the request.
+            loop {
+                match handle(&stream, &dongle, &state) {
+                    Ok(Served::More) => continue,
+                    Ok(Served::Done) => break,
+                    Err(e) => {
+                        eprintln!("control socket client: {e}");
+                        let mut s = &stream;
+                        // Alternate form, so the client is told the whole chain
+                        // rather than just the outermost "reading request
+                        // payload".
+                        let _ = reply(&mut s, kind::ACK, &refusal(&format!("{e:#}")));
+                        break;
+                    }
+                }
             }
         });
     }
@@ -276,10 +290,26 @@ pub fn ack_name(code: u8) -> &'static str {
     }
 }
 
-fn handle(stream: &UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonState) -> Result<()> {
+/// Whether the connection is still worth reading from.
+enum Served {
+    More,
+    Done,
+}
+
+fn handle(
+    stream: &UnixStream,
+    dongle: &Arc<Mutex<Dongle>>,
+    state: &DaemonState,
+) -> Result<Served> {
     let mut stream = stream;
     let mut header = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header).context("reading request header")?;
+    // A clean hangup between requests is how a client says it is finished, not
+    // an error to report.
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Served::Done),
+        Err(e) => return Err(e).context("reading request header"),
+    }
     let h = Header::decode(&header).map_err(|e| anyhow::anyhow!("bad request header: {e:?}"))?;
 
     let mut payload = vec![0u8; h.len as usize];
@@ -290,7 +320,8 @@ fn handle(stream: &UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonState)
     match h.kind {
         local::GET_DAEMON_STATUS => {
             let body = [state.focus.load(Ordering::Relaxed), 1];
-            reply(&mut stream, local::DAEMON_STATUS, &body)
+            reply(&mut stream, local::DAEMON_STATUS, &body)?;
+            Ok(Served::More)
         }
         // Anything else is for the dongle. Forward it and relay the answer.
         _ => {
@@ -302,7 +333,8 @@ fn handle(stream: &UnixStream, dongle: &Arc<Mutex<Dongle>>, state: &DaemonState)
                 _ => kind::ACK,
             };
             let (k, p) = state.request(dongle, h.kind, &payload, want, Duration::from_secs(3))?;
-            reply(&mut stream, k, &p)
+            reply(&mut stream, k, &p)?;
+            Ok(Served::More)
         }
     }
 }

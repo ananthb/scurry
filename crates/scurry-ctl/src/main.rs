@@ -23,6 +23,7 @@ commands:
   set-config <file>   store a TOML layout on the dongle
   ping                check the link
   test-move           drive synthetic motion, printing everything the dongle says
+  latency             measure round-trip time to the dongle
   wireless            show the state of the wireless control link
   pair [seconds]      open the pairing window so a controller can be authorised
   forget-controller   revoke the authorised wireless controller
@@ -64,6 +65,7 @@ fn main() -> Result<()> {
         "set-config" => set_config(args.get(1).map(String::as_str).unwrap_or_else(|| usage())),
         "ping" => ping(),
         "test-move" => test_move(),
+        "latency" => latency(),
         "wireless" => wireless(),
         "pair" => pair(args.get(1).map(String::as_str)),
         "forget-controller" => forget_controller(),
@@ -173,10 +175,16 @@ fn request(d: &mut Dongle, req: u8, payload: &[u8], want: u8) -> Result<Message>
 fn run() -> Result<()> {
     use std::sync::{Arc, Mutex};
 
-    // Headless capture owns the port itself; there is no app to defer to.
-    let path = Dongle::autodetect()?;
-    eprintln!("dongle: {path}");
-    let dongle = Arc::new(Mutex::new(Dongle::open(&path)?));
+    // Headless capture owns the link itself; there is no app to defer to.
+    let link = if wireless_requested() {
+        eprintln!("scanning for a dongle over BLE...");
+        Dongle::open_wireless(SCAN_FOR)?
+    } else {
+        let path = Dongle::autodetect()?;
+        Dongle::open(&path)?
+    };
+    eprintln!("dongle: {}", link.describe());
+    let dongle = Arc::new(Mutex::new(link));
     let state = Arc::new(scurry_ctl::ipc::DaemonState::default());
 
     // The control socket runs alongside capture so the tray can reach the
@@ -371,5 +379,40 @@ fn forget_controller() -> Result<()> {
         bail!("the dongle refused: {}", ack_message(&msg.payload));
     }
     println!("the wireless controller is no longer authorised");
+    Ok(())
+}
+
+/// Measure round-trip time with pings.
+///
+/// The README calls latency the design's known weak point and says it is
+/// unmeasured. Over the cable this is the cost of a USB round trip and is
+/// nothing; over BLE it is bounded by the connection interval, which the host
+/// chooses -- Apple's guidelines put the floor at 15ms in 15ms steps, so the
+/// number here is mostly a readout of what macOS decided to negotiate.
+///
+/// This measures the control path, not the pointer path. A real report also
+/// waits on the dongle's second radio hop out to the target, which nothing here
+/// can see -- so treat this as the optimistic half of the answer.
+fn latency() -> Result<()> {
+    const ROUNDS: usize = 30;
+    let mut link = open_link()?;
+
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let start = std::time::Instant::now();
+        link.request(kind::PING, &[], kind::PONG)?;
+        samples.push(start.elapsed());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    samples.sort();
+
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let total: f64 = samples.iter().map(|d| ms(*d)).sum();
+    println!("{ROUNDS} round trips");
+    println!("  min    {:.1} ms", ms(samples[0]));
+    println!("  median {:.1} ms", ms(samples[ROUNDS / 2]));
+    println!("  p90    {:.1} ms", ms(samples[ROUNDS * 9 / 10]));
+    println!("  max    {:.1} ms", ms(samples[ROUNDS - 1]));
+    println!("  mean   {:.1} ms", total / ROUNDS as f64);
     Ok(())
 }
