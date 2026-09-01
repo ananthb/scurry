@@ -1,4 +1,4 @@
-# Spike: concurrent multi-host BLE HID on the ESP32-C3
+# 001 — Concurrent bonded hosts on one ESP32-C3
 
 **Verdict: it works.** One C3 holds simultaneous *bonded* HID connections to
 multiple hosts. Switching machines is choosing a `conn_id`, not paying a BLE
@@ -52,11 +52,11 @@ constraint on a 400KB part and it turned out to be comfortable.
 
 ## Not yet established
 
-The spike proves connections coexist. It does **not** yet show:
+The spike proves connections coexist. It did **not** show:
 
-- **Latency.** The granted connection interval is still unmeasured. This is the
-  design's known weak point — macOS is expected to clamp to 15-30ms.
-- **Per-connection routing.** The demo still sends to a single `hid_conn_id`.
-  Writing a report to a *chosen* host is the next thing to prove.
-- **Scale past two.** Configured for 4; two were tested.
-- **Bond persistence across reboot.**
+| Left open | Since |
+|---|---|
+| **Latency**, the design's known weak point | Measured in [003](003-link-latency.md). |
+| **Per-connection routing** — the demo sent to a single `hid_conn_id` | Done; the layout picks a `conn_id` per report, and screens are pinned to peer addresses so a reboot cannot swap them. |
+| **Bond persistence across reboot** | Holds. Bonds, layout and the pinned controller all survive a reflash, which rewrites the app but not the NVS partition. |
+| **Scale past two** | Still two targets tested. Three links have run at once — two targets and a wireless controller — see [002](002-wireless-control-link.md). |

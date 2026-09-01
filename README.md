@@ -28,16 +28,36 @@ nothing to install anywhere.
 
 ## Status
 
-Mouse first; keyboard comes after. Keyboard is not merely more of the same —
-the controller sees OS keysyms, the dongle must emit raw HID usage codes, and
-the target applies its own keymap on top.
+Mouse and keyboard both work, across two targets, driven from macOS.
+
+Keyboard was never merely more of the same — the controller sees OS keysyms,
+the dongle must emit raw HID usage codes, and the target applies its own keymap
+on top. Cmd against a PC-style target is a per-screen setting rather than a
+guess.
 
 | Piece | State |
 |---|---|
 | `scurry-proto` wire format | done, tested, `no_std` verified on riscv32imc |
 | `scurry-ctl` layout engine | done, tested |
-| `scurry-ctl` input capture | macOS event tap done, untested on device |
-| dongle BLE HID firmware | working: reports reach a paired machine |
+| `scurry-ctl` input capture | macOS event tap, working on device |
+| dongle BLE HID firmware | working: mouse and keyboard reach bonded targets |
+| wireless controller link | experimental; works, see [002](doc/experiments/002-wireless-control-link.md) |
+| Linux and Windows capture | not started |
+
+Everything that was not obviously going to work is written up in
+[`doc/experiments/`](doc/experiments/), verdict first.
+
+### Two ways to reach the dongle
+
+The cable is the one that always works: USB CDC, 0.3ms round trip, and the only
+path that can authorise a wireless controller.
+
+The wireless link is experimental. The dongle carries the same protocol over a
+custom GATT service, so it can sit on a charger between the machines instead of
+hanging off one of them — at 16.8ms median and 30.4ms p90, and one fewer target,
+because the controller takes one of the radio's four links. Authorising one
+takes physical presence: three presses of the dongle's button, or a request over
+the cable, which is refused if it arrives over the air.
 
 ### The spike
 
@@ -45,7 +65,7 @@ The architecture rests on one unverified claim: that a single ESP32-C3 can hold
 **concurrent bonded HID connections** to several hosts at once.
 
 **It can.** Two machines held simultaneous bonded HID connections on a C3, with
-no disconnect when the second arrived. See `doc/spike-results.md`. Switching is
+no disconnect when the second arrived. See `doc/experiments/001-concurrent-bonded-hosts.md`. Switching is
 therefore a choice of `conn_id`, not a reconnect, and the dongle role needs no
 S3.
 
