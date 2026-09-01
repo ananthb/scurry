@@ -29,6 +29,12 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- Required before CoreBluetooth will hand out a central manager: the
+         wireless link connects to the dongle's control service. macOS shows
+         this string in the permission prompt, and an app that uses Bluetooth
+         without declaring why is refused rather than asked about. -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>scurry connects to your dongle over Bluetooth when it is not plugged in.</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
 </dict>
