@@ -9,13 +9,26 @@
 
 
 # Node 0 is this machine. Input stays local and is never transmitted.
+#
+# Sizes are *logical* units -- points on a Mac, not backing pixels. The capture
+# layer measures the local screen with CGDisplayBounds and compares the cursor
+# against it, so a Retina Mac described here at its 3024x1964 panel size is
+# claiming a screen twice as wide as the one the cursor actually crosses: the
+# pointer reaches the layout's edge at the halfway mark and hands over with
+# half the display to spare.
+#
+#   Get the right numbers with:  osascript -e 'tell application "Finder" to get bounds of window of desktop'
+#
+# The same applies to every other screen: use what the machine reports, not what
+# its panel is. A Chromebook with a 2560x1600 panel running at 2x moves its
+# pointer through 1280x800, and 1280x800 is what belongs here.
 [[screen]]
 name = "mac"
 node = 0
 x = 0
 y = 0
-width = 3024
-height = 1964
+width = 1512
+height = 982
 
 # Remote screens are 1..=4, mapping onto the dongle's bonded connection slots
 # in bond order. Placed to the right of the Mac, vertically centred against it.
@@ -26,7 +39,7 @@ node = 1
 # Without it the node is whichever machine connects into that slot first, so a
 # dongle reboot can silently swap two screens.
 address = "f0:68:e3:e5:d1:b1"
-x = 3024
-y = 262
-width = 2560
-height = 1440
+x = 1512
+y = -129
+width = 1280
+height = 1240

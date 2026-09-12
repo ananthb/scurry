@@ -16,7 +16,7 @@ pub mod keymap;
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{accessibility_trusted, install, run, CaptureHandle};
+pub use macos::{accessibility_trusted, install, resync_cursor, run, CaptureHandle};
 
 #[cfg(not(target_os = "macos"))]
 pub fn run(
@@ -36,6 +36,11 @@ fn apply_focus(node: u8) {
 
 #[cfg(not(target_os = "macos"))]
 fn apply_focus(_node: u8) {}
+
+/// Nothing to reconcile without a local cursor to move. See the macOS version
+/// for what this is for.
+#[cfg(not(target_os = "macos"))]
+pub fn resync_cursor() {}
 
 /// True while a thread is draining the dongle.
 static READER_RUNNING: AtomicBool = AtomicBool::new(false);

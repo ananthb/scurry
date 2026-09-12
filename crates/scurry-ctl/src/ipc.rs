@@ -317,6 +317,15 @@ fn handle(
         _ => kind::ACK,
     };
     let (k, p) = state.request(dongle, h.kind, &payload, want, Duration::from_secs(3))?;
+
+    // A stored layout puts the dongle's pointer at the centre of the local
+    // screen, so the cursor has to be moved to meet it or the two disagree by
+    // however far the cursor happened to be from the middle -- and that gap is
+    // a handoff that fires before the pointer reaches the edge.
+    if h.kind == kind::SET_CONFIG && k == kind::ACK && p.first() == Some(&ack::OK) {
+        crate::capture::resync_cursor();
+    }
+
     reply(&mut stream, k, &p)?;
     Ok(Served::More)
 }

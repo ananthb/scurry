@@ -95,6 +95,18 @@ fixed-function: it enumerates as CDC-ACM and its descriptors are not
 programmable. Presenting as a mouse needs a real USB OTG controller, which only
 the S2, S3, and P4 have.
 
+## Screen sizes are logical, not physical
+
+A screen's rectangle is in the units its own pointer moves through, which is
+rarely the panel's pixel count. A Retina Mac's cursor crosses 1512x982 points,
+not 3024x1964 pixels; a Chromebook with a 2560x1600 panel running at 2x moves
+through 1280x800.
+
+Get it wrong and the symptom is oddly specific: the pointer hands over to the
+next machine before reaching the edge of the screen, because it reached the edge
+of the *layout* at the halfway mark. `scurry.toml.example` says where to read
+the right numbers from.
+
 ## Layout
 
 - `crates/scurry-proto` — the wire format. Zero dependencies, `no_std`, shared

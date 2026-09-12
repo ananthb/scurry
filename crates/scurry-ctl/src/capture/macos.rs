@@ -284,6 +284,47 @@ fn is_remote() -> bool {
     FOCUS.load(Ordering::Relaxed) != 0
 }
 
+/// Put the local cursor where a freshly loaded layout believes the pointer is.
+///
+/// `Layout::new` starts the pointer at the centre of the local screen. The real
+/// cursor is wherever it was left, and nothing reconciles the two: while the
+/// pointer is local the tap forwards the cursor's *own* movement, so the two
+/// track each other faithfully and keep whatever gap they began with.
+///
+/// The gap shows as a handoff that fires early -- the virtual pointer reaches
+/// the screen edge while the visible cursor is still short of it, and the Mac
+/// hands over with an inch of screen to spare. It heals itself after one round
+/// trip, because coming back parks the cursor at the virtual position, which is
+/// why it looks like a glitch that fixes itself rather than a bug. This makes
+/// the first crossing right as well.
+///
+/// Centre, rather than telling the dongle where the cursor is, because the
+/// protocol carries relative motion and has no message for an absolute
+/// position. Moving the cursor is the one lever this side has.
+pub fn resync_cursor() {
+    // A display may have been rearranged since the last look, and the centre
+    // depends on its size.
+    refresh_display_bounds();
+    let b = display_bounds();
+    let (x, y) = (b.x + b.width / 2, b.y + b.height / 2);
+
+    // Stored before the warp, not after. The warp generates a motion event of
+    // its own, and unless this side already believes the cursor is there, that
+    // event reads as a real jump to the middle of the screen and is forwarded
+    // to the dongle -- reintroducing exactly the offset being removed.
+    LAST_X.store(x, Ordering::Relaxed);
+    LAST_Y.store(y, Ordering::Relaxed);
+    PARK_X.store(x, Ordering::Relaxed);
+    PARK_Y.store(y, Ordering::Relaxed);
+
+    unsafe {
+        report(
+            "CGWarpMouseCursorPosition",
+            CGWarpMouseCursorPosition(CGPoint { x: x as f64, y: y as f64 }),
+        );
+    }
+}
+
 /// Pin the local cursor while the pointer belongs to another machine.
 ///
 /// Re-asserted on *every* remote event, not just at handoff. macOS re-associates
