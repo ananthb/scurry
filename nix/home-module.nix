@@ -56,9 +56,30 @@ in
       (lib.hm.dag.entryAfter [ "writeBoundary" ] ''
         app_src="${cfg.package}/Applications/scurry.app"
         app_dst="$HOME/Applications/scurry.app"
+        stamp="$app_dst/Contents/.scurry-store-path"
         if [ -d "$app_src" ]; then
-          $DRY_RUN_CMD rm -rf "$app_dst"
-          $DRY_RUN_CMD cp -RL "$app_src" "$app_dst"
+          # Do nothing at all when scurry has not changed.
+          #
+          # This ran on every generation, and most generations have nothing to
+          # do with scurry -- adding a shell alias rebuilt and replaced the app
+          # too. Each time it deleted the bundle and made a new one, and
+          # deleting an app is how you tell macOS to forget it: TCC prunes the
+          # Accessibility grant for a bundle that is no longer there, so the
+          # permission had to be granted again after a rebuild that changed
+          # nothing about scurry whatsoever.
+          if [ -f "$stamp" ] && [ "$(cat "$stamp" 2>/dev/null)" = "${cfg.package}" ]; then
+            : # already current
+          else
+          # rsync into the existing directory rather than rm -rf and cp.
+          #
+          # The bundle keeps its identity on disk and only its contents change,
+          # so there is never a moment when ~/Applications/scurry.app does not
+          # exist. The signature below is what makes the grant survive the new
+          # binary; not deleting the bundle is what stops it being thrown away
+          # before the signature gets a chance to.
+          $DRY_RUN_CMD mkdir -p "$app_dst"
+          $DRY_RUN_CMD ${pkgs.rsync}/bin/rsync -a --delete --copy-links \
+            "$app_src/" "$app_dst/"
           $DRY_RUN_CMD chmod -R u+w "$app_dst"
           $DRY_RUN_CMD xattr -dr com.apple.quarantine "$app_dst" 2>/dev/null || true
 
@@ -78,13 +99,26 @@ in
           # Create one with nix/setup-signing.sh.
           if /usr/bin/security find-identity -v -p codesigning 2>/dev/null \
               | grep -q scurry-local-signing; then
+            # Failures are reported rather than swallowed. A silent `|| true`
+            # here left the bundle carrying the ad-hoc signature the linker
+            # produced, which looks identical until the permission is quietly
+            # dropped on the next rebuild -- the exact symptom this signing
+            # exists to prevent, hidden by the error handling meant to be
+            # tidy about it.
             $DRY_RUN_CMD /usr/bin/codesign --force --deep \
-              --sign scurry-local-signing "$app_dst" >/dev/null 2>&1 || true
+              --sign scurry-local-signing "$app_dst" >/dev/null 2>&1 \
+              || echo "scurry: signing the app bundle failed; Accessibility" \
+                      "will need re-granting after each rebuild" >&2
           else
             echo "scurry: no local signing identity; Accessibility will need" \
                  "re-granting after each rebuild. Run nix/setup-signing.sh." >&2
             $DRY_RUN_CMD /usr/bin/codesign --force --deep --sign - "$app_dst" \
               >/dev/null 2>&1 || true
+          fi
+
+          # Written last, so an interrupted or failed install is not recorded
+          # as current and is retried on the next generation.
+          $DRY_RUN_CMD printf '%s' "${cfg.package}" > "$stamp"
           fi
         fi
       '');
