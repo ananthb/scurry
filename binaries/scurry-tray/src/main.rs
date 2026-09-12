@@ -5,6 +5,7 @@
 //!   --settings             the settings window, launched by the tray
 //!   --print-desktop-entry  regenerate packaging/scurry-tray.desktop
 
+mod firmware;
 mod login;
 mod packaging;
 mod settings;

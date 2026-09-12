@@ -277,6 +277,8 @@ pub fn ack_name(code: u8) -> &'static str {
         ack::BAD_REQUEST => "bad request",
         ack::INVALID_LAYOUT => "invalid layout",
         ack::STORAGE_FAILED => "storage failed",
+        ack::NOT_PERMITTED => "not authorised",
+        ack::OTA_FAILED => "the firmware update failed; the dongle still runs the old image",
         _ => "unknown error",
     }
 }
@@ -313,10 +315,23 @@ fn handle(
         kind::GET_CONFIG => kind::CONFIG,
         kind::GET_STATUS => kind::STATUS,
         kind::GET_WIRELESS => kind::WIRELESS,
+        kind::GET_FIRMWARE => kind::FIRMWARE,
+        // A chunk is answered with progress rather than a bare ack, which is
+        // what makes the reply double as flow control.
+        kind::OTA_DATA => kind::OTA_STATUS,
         kind::PING => kind::PONG,
         _ => kind::ACK,
     };
-    let (k, p) = state.request(dongle, h.kind, &payload, want, Duration::from_secs(3))?;
+    // Three seconds is right for a config read and wrong by an order of
+    // magnitude for the two slow steps of an update: OTA_BEGIN erases a 1.5MB
+    // slot before it answers, and OTA_END reads back and validates whatever
+    // landed in it. Timing those out would abandon a perfectly good transfer
+    // and, worse, report it as a failure.
+    let timeout = match h.kind {
+        kind::OTA_BEGIN | kind::OTA_END => Duration::from_secs(30),
+        _ => Duration::from_secs(3),
+    };
+    let (k, p) = state.request(dongle, h.kind, &payload, want, timeout)?;
 
     // A stored layout puts the dongle's pointer at the centre of the local
     // screen, so the cursor has to be moved to meet it or the two disagree by
@@ -351,6 +366,17 @@ impl Client {
         })?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         Ok(Self { stream })
+    }
+
+    /// Wait longer for a reply.
+    ///
+    /// The default suits a question the dongle answers immediately. A firmware
+    /// update has two steps that take seconds -- erasing a slot and validating
+    /// what went into it -- and a client that gave up at five would abandon a
+    /// transfer that was going perfectly well.
+    pub fn set_timeout(&mut self, d: std::time::Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(d))?;
+        Ok(())
     }
 
     pub fn request(&mut self, kind: u8, payload: &[u8]) -> Result<(u8, Vec<u8>)> {

@@ -1,0 +1,18 @@
+# Two app slots, so an update is written somewhere other than where the
+# running firmware lives. That is the whole reason this file exists: the
+# default single-"factory" layout has nowhere to put a second image, and an
+# update that overwrites the only copy has no way back if it goes wrong.
+#
+# 1.5MB a slot against an 0.8MB image. The headroom is deliberate -- a slot
+# that fits today's build exactly is one feature away from being the reason a
+# release cannot ship.
+#
+# otadata records which slot to boot and whether the last one confirmed
+# itself; without it the bootloader has no way to roll anything back.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x180000,
+ota_1,      app,  ota_1,   0x1a0000, 0x180000,

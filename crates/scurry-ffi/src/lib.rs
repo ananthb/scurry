@@ -270,6 +270,41 @@ pub unsafe extern "C" fn scurry_layout_node_for_address(bda: *const u8) -> i32 {
     -1
 }
 
+/// Copy the name of the screen at `node` into `out`, NUL-terminated.
+///
+/// Returns the number of bytes written excluding the terminator, or -1 if
+/// there is no layout, no such node, or nowhere to put the answer.
+///
+/// This exists for the dongle's screen. It used to show the last two bytes of
+/// each target's Bluetooth address, which distinguishes machines correctly and
+/// tells you nothing about them -- "A1B2" is not what anybody calls their
+/// laptop. The layout has had the names all along; nothing could read one back.
+///
+/// # Safety
+/// `out` must point to `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn scurry_layout_name_for_node(node: u8, out: *mut u8, cap: usize) -> i32 {
+    if out.is_null() || cap == 0 {
+        return -1;
+    }
+    let layout = match &*core::ptr::addr_of!(LAYOUT) {
+        Some(l) => l,
+        None => return -1,
+    };
+    let Some(screen) = layout.screens().iter().find(|s| s.node == node) else {
+        return -1;
+    };
+    let name = screen.name().as_bytes();
+    // Truncated on a character boundary would be nicer, but the panel this
+    // feeds shows four characters at double size: any name long enough to be
+    // cut is being cut mid-word regardless, and these are ASCII in practice.
+    let n = core::cmp::min(name.len(), cap - 1);
+    let dst = core::slice::from_raw_parts_mut(out, cap);
+    dst[..n].copy_from_slice(&name[..n]);
+    dst[n] = 0;
+    n as i32
+}
+
 /// The most recent availability mask, waiting to be applied.
 ///
 /// Deferred rather than applied here because this is called from the Bluetooth

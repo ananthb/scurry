@@ -9,6 +9,7 @@
 use eframe::egui;
 use scurry_ctl::config::{Config, ScreenConfig};
 
+use crate::firmware::FirmwarePane;
 use crate::status;
 
 pub fn run() -> anyhow::Result<()> {
@@ -27,7 +28,21 @@ pub fn run() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("settings window: {e}"))
 }
 
+/// Which pane the window is showing. Firmware updates and the desktop layout
+/// have nothing to do with each other and want the whole width, so they are
+/// tabs rather than two halves of one scroll.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Tab {
+    Layout,
+    Firmware,
+}
+
 struct SettingsApp {
+    tab: Tab,
+    firmware: FirmwarePane,
+    /// The firmware tab has not been opened yet, so nothing has been asked of
+    /// the dongle or of GitHub.
+    firmware_unchecked: bool,
     screens: Vec<ScreenConfig>,
     /// Result of the last load or save, shown inline. `Ok` messages are
     /// transient reassurance; `Err` messages are the whole reason this pane can
@@ -37,7 +52,13 @@ struct SettingsApp {
 
 impl SettingsApp {
     fn new() -> Self {
-        let mut app = Self { screens: Vec::new(), message: None };
+        let mut app = Self {
+            tab: Tab::Layout,
+            firmware: FirmwarePane::default(),
+            firmware_unchecked: true,
+            screens: Vec::new(),
+            message: None,
+        };
         app.load();
         app
     }
@@ -79,6 +100,34 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.selectable_label(self.tab == Tab::Layout, "Virtual desktop").clicked() {
+                    self.tab = Tab::Layout;
+                }
+                if ui.selectable_label(self.tab == Tab::Firmware, "Firmware").clicked() {
+                    // Checked on arrival rather than at startup: it makes two
+                    // network-ish calls, and the layout tab is what most opens
+                    // of this window are for.
+                    if self.firmware_unchecked {
+                        self.firmware_unchecked = false;
+                        self.firmware.refresh();
+                    }
+                    self.tab = Tab::Firmware;
+                }
+            });
+            ui.add_space(6.0);
+        });
+
+        if self.tab == Tab::Firmware {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(4.0);
+                self.firmware.ui(ui, ctx);
+            });
+            return;
+        }
+
         egui::TopBottomPanel::top("head").show(ctx, |ui| {
             ui.add_space(8.0);
             ui.heading("Virtual desktop");

@@ -58,6 +58,11 @@ uint8_t scurry_map_modifiers(uint8_t node, uint8_t host);
    was free, which silently swapped screens across a reboot. */
 int32_t scurry_layout_node_for_address(const uint8_t *bda);
 
+/* The name of the screen at `node`, NUL-terminated, for the dongle's display.
+   Returns the length written, or -1 when there is no layout or no such node --
+   in which case the caller has nothing better to show than the address. */
+int32_t scurry_layout_name_for_node(uint8_t node, uint8_t *out, size_t cap);
+
 /* Declare which nodes can receive input, as a bitmask where bit N means node N.
    Node 0 is always available. Without this the pointer crosses onto machines
    that are not connected, which looks like it sticking to an edge and dying. */

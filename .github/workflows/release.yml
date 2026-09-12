@@ -127,8 +127,53 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  firmware:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The firmware reports its version from `git describe`, and that is
+          # what the app compares a release against to decide whether the
+          # dongle needs updating. A shallow checkout has no tags, so the build
+          # would stamp a bare commit hash and every dongle would look
+          # permanently out of date.
+          fetch-depth: 0
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # crates.io 403s any User-Agent starting with "curl/", and nixpkgs'
+          # fetchurl sends "curl/<ver> Nixpkgs/<ver>". NIX_CURL_FLAGS is appended
+          # after that flag so the later -A wins; the short form is joined to its
+          # value because impure-env splits on spaces. Without this, any crate not
+          # already in the cache fails to download.
+          extra-conf: |
+            extra-experimental-features = configurable-impure-env
+            impure-env = NIX_CURL_FLAGS=-ANixpkgs
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Only the app image is published. The bootloader and partition table are
+      # not part of an update: an OTA writes the inactive app slot and nothing
+      # else, and a dongle that needs a new partition table needs a cable
+      # anyway, which is a different and rarer errand.
+      - name: Build dongle firmware
+        run: |
+          nix develop .#esp --command bash -c '
+            cd firmware/dongle
+            idf.py set-target esp32c3
+            idf.py build
+          '
+          mkdir -p dist
+          cp firmware/dongle/build/hidd_demos.bin dist/scurry-dongle-esp32c3.bin
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/
+          if-no-files-found: error
+
   release:
-    needs: [linux, macos]
+    needs: [linux, macos, firmware]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -177,6 +222,12 @@ jobs:
             **Linux** — the AppImage runs the tray directly. The tarball also
             carries the systemd user unit, the desktop entry, and a udev rule
             granting access to the dongle without adding yourself to `dialout`.
+
+            **Dongle firmware** — `scurry-dongle-esp32c3.bin`. You do not need
+            to download it: the tray offers the update when it sees the dongle
+            running something older, and `scurry-ctl flash` fetches this same
+            asset. It is here for anyone who would rather hold the file, and
+            it is covered by `SHA256SUMS`.
 
             **Linux** — `.deb` and `.rpm` install the binaries, the desktop
             entry, and a udev rule granting access to the dongle. The AppImage

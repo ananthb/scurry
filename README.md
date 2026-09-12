@@ -41,6 +41,8 @@ guess.
 | `scurry-ctl` layout engine | done, tested |
 | `scurry-ctl` input capture | macOS event tap, working on device |
 | dongle BLE HID firmware | working: mouse and keyboard reach bonded targets |
+| 0.42" OLED status display | working: identity, links, pairing window, passkey |
+| firmware updates over the link | working: verified over the cable, onto a live dongle |
 | wireless controller link | experimental; works, see [002](doc/experiments/002-wireless-control-link.md) |
 | Linux and Windows capture | not started |
 
@@ -57,7 +59,9 @@ custom GATT service, so it can sit on a charger between the machines instead of
 hanging off one of them — at 16.8ms median and 30.4ms p90, and one fewer target,
 because the controller takes one of the radio's four links. Authorising one
 takes physical presence: three presses of the dongle's button, or a request over
-the cable, which is refused if it arrives over the air.
+the cable, which is refused if it arrives over the air. On a board with the
+screen fitted the window also shows a six-digit passkey the controller must
+confirm, so the link is no longer merely encrypted but unauthenticated.
 
 ### The spike
 
@@ -74,6 +78,94 @@ Latency remains unmeasured, and that is the design's known weak point.
 ## Hardware
 
 One ESP32-C3. That is the whole bill of materials.
+
+### Updating the dongle
+
+The dongle is the one part of this that is not a file on somebody's laptop, and
+until recently the only way to change it was a cable, a held BOOT button and a
+tapped RST. That is awkward on the best board and worse on one deliberately
+parked on a charger between two machines, which is where the wireless link was
+built to let it sit.
+
+So an image now goes over the same protocol the pointer uses, over whichever
+transport is to hand:
+
+```sh
+scurry-ctl firmware          # what it runs, and what the latest release is
+scurry-ctl flash             # install the latest release
+scurry-ctl flash --file f.bin # install something you built
+```
+
+The tray has the same thing under **Firmware**, including dropping a `.bin`
+onto the window.
+
+CI publishes `scurry-dongle-esp32c3.bin` with every release and the clients
+fetch it from there, so the normal path involves no files at all. Only the app
+image is published: an update writes the inactive app slot and nothing else.
+
+Three things keep it from being a way to brick the dongle:
+
+- **Two app slots.** The image is written to the one that is not running, so a
+  transfer that fails at 90% has damaged nothing.
+- **The image is described before it is sent** — length and SHA-256 up front —
+  so one that was never going to be accepted is refused before a flash erase
+  and a minute of radio time have been spent on it.
+- **The bootloader can undo it.** A freshly booted image is on probation and
+  reverts on the next reset unless it stays up for twenty seconds. That matters
+  precisely in the case that is otherwise unrecoverable: an update sent over the
+  air, to a dongle nobody is standing next to, that boots into something unable
+  to talk.
+
+Writing firmware is held to the same standard as authorising a controller, and
+for a sharper reason: a controller that can type is a live compromise, one that
+can flash is a permanent one. So an image is accepted over the cable, or from a
+controller that has already been authorised, and refused otherwise.
+
+Note that a dongle running firmware older than this has a single `factory`
+partition and nowhere to put a second image. It says so when asked, and needs
+one cable flash to gain the two-slot layout — after which it can update itself.
+NVS keeps its offset across that change, so bonds and the stored layout survive.
+
+### The optional screen
+
+A 0.42" SSD1306 OLED, if the board has one soldered on -- the same firmware
+runs on a board without it and simply logs one line and stays headless, because
+losing the mouse over a missing screen would be a poor trade for a status
+readout.
+
+Fitted, it is 72x40: twelve characters by five lines, or six at double size.
+Two screens alternate every fifteen seconds.
+
+The first is the dongle's name. "Scurry" is on every board ever built and the
+four characters after it are the whole answer to "which one is this", so the
+prefix is set small and the id as large as fits -- at triple size four
+characters span 69 of the 72 pixels available.
+
+The second is the links, and only the links that exist. Drawing a fixed four
+rows spent the panel's scarcest resource on its least information: on a desk
+with one target, three of those rows said "----", which is not news. So the
+rows are the connections and the text grows into whatever they leave. One or
+two targets -- which is most desks -- puts the addresses up at double size,
+legible across a room rather than at arm's length.
+
+Everything is centred by pixel rather than by character cell. Cell centring can
+only place a string on a multiple of six pixels, which left odd-length lines up
+to three pixels off true: invisible alone, obvious the moment two of them are
+stacked.
+
+The button is counted rather than held, so it carries all of this by press
+count, ordered by consequence: one flips between the two screens, two summons
+the Bluetooth address, three opens the pairing window. A pairing window or an
+update in progress preempts the rotation, because those are the two states
+where somebody needs to be told something rather than shown it.
+
+The screen earns its place twice over. The pairing window used to be invisible:
+you pressed the button three times and then had to trust that something had
+happened, because the only confirmation was a log line on a cable you may not
+have been holding. And a device with no display cannot prove to a controller
+that the controller is talking to it and not to something in the middle, which
+is why the wireless link bonded Just Works. Both of those are now fixed, and
+neither is fixable without hardware.
 
 The C3 is enough: a mouse report is 7 bytes at ~125Hz, so this is latency-bound
 on the BLE connection interval, not throughput-bound on the CPU. A second core

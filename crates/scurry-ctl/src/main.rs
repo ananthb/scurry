@@ -27,6 +27,9 @@ commands:
   wireless            show the state of the wireless control link
   pair [seconds]      open the pairing window so a controller can be authorised
   forget-controller   revoke the authorised wireless controller
+  firmware            show the dongle's firmware version and the latest release
+  flash [--file F]    update the dongle's firmware, from the latest release
+                      or from a local image
 
 options:
   --wireless          reach the dongle over BLE instead of the cable
@@ -69,6 +72,8 @@ fn main() -> Result<()> {
         "wireless" => wireless(),
         "pair" => pair(args.get(1).map(String::as_str)),
         "forget-controller" => forget_controller(),
+        "firmware" => firmware(),
+        "flash" => flash(&args[1..]),
         _ => usage(),
     }
 }
@@ -137,6 +142,101 @@ impl Link {
             Link::Serial(d) => request(d, req, payload, want),
         }
     }
+}
+
+impl scurry_ctl::update::Link for Link {
+    fn request(&mut self, kind: u8, payload: &[u8], want: u8) -> Result<Vec<u8>> {
+        Link::request(self, kind, payload, want).map(|m| m.payload)
+    }
+}
+
+fn firmware() -> Result<()> {
+    let mut link = open_link()?;
+    let info = scurry_ctl::update::firmware_info(&mut link)?;
+
+    let running = info.version_str();
+    println!("dongle:  {}", if running.is_empty() { "(unversioned build)" } else { running });
+    println!("updates: {}", if info.ota_capable {
+        "supported"
+    } else {
+        "not supported by this build -- it has a single app slot, so it must be \n         reflashed over the cable once before it can take an update"
+    });
+    if info.pending_verify {
+        println!("note:    this image is still on probation and has not confirmed itself yet");
+    }
+
+    match scurry_ctl::update::latest_release() {
+        Ok(rel) => {
+            println!("latest:  {}", rel.tag);
+            if scurry_ctl::update::is_newer(&rel.tag, running) {
+                println!("\n{} is newer. Run `scurry-ctl flash` to install it.", rel.tag);
+            } else {
+                println!("\nNothing newer to install.");
+            }
+        }
+        Err(e) => println!("latest:  could not be checked ({e})"),
+    }
+    Ok(())
+}
+
+fn flash(args: &[String]) -> Result<()> {
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                file = Some(args.get(i + 1).cloned().unwrap_or_else(|| usage()));
+                i += 2;
+            }
+            _ => usage(),
+        }
+    }
+
+    let (image, what) = match &file {
+        Some(path) => (
+            std::fs::read(path).with_context(|| format!("reading {path}"))?,
+            path.clone(),
+        ),
+        None => {
+            eprintln!("checking for the latest release...");
+            let rel = scurry_ctl::update::latest_release()?;
+            eprintln!("downloading {} ({})...", rel.tag, scurry_ctl::update::FIRMWARE_ASSET);
+            (scurry_ctl::update::download_firmware(&rel)?, rel.tag)
+        }
+    };
+
+    let mut link = open_link()?;
+    // Through the app, the reply to an erase or a validation is slower than
+    // anything else the socket carries. See Client::set_timeout.
+    if let Link::Socket(c) = &mut link {
+        c.set_timeout(Duration::from_secs(45))?;
+    }
+    let info = scurry_ctl::update::firmware_info(&mut link)?;
+    if !info.ota_capable {
+        bail!(
+            "this dongle runs a build with a single app slot, so it has nowhere to put \n\
+             a second image. Flash it once over the cable with `idf.py flash`; after that \n\
+             it can update itself."
+        );
+    }
+    eprintln!(
+        "dongle runs {}, installing {what} ({} bytes)",
+        if info.version_str().is_empty() { "an unversioned build" } else { info.version_str() },
+        image.len()
+    );
+
+    let mut last_pct = u32::MAX;
+    scurry_ctl::update::flash(&mut link, &image, &mut |sent, total| {
+        let pct = sent * 100 / total.max(1);
+        // Only on change: over the cable this fires a thousand times a second
+        // and the terminal becomes the bottleneck.
+        if pct != last_pct {
+            last_pct = pct;
+            eprint!("\r  {pct}% ({sent}/{total} bytes)");
+        }
+    })?;
+    eprintln!("\rdone. The dongle is rebooting into the new firmware.        ");
+    Ok(())
 }
 
 /// A request kind in words, for messages a user reads.

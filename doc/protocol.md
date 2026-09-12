@@ -43,10 +43,72 @@ buffer: it has no allocator to grow one.
 | `0x16` | `GET_WIRELESS` | controller → dongle. |
 | `0x17` | `WIRELESS` | dongle → controller. Authorised controllers, and which drives. |
 | `0x18` | `SET_WIRELESS` | controller → dongle. Open the pairing window, or revoke. |
+| `0x19` | `GET_FIRMWARE` | controller → dongle. |
+| `0x1a` | `FIRMWARE` | dongle → controller. Version, and whether it can be updated. |
+| `0x20` | `OTA_BEGIN` | controller → dongle. Length and SHA-256 of an image. |
+| `0x21` | `OTA_DATA` | controller → dongle. One chunk, offset first. |
+| `0x22` | `OTA_END` | controller → dongle. Verify and stage the image. |
+| `0x23` | `OTA_ABORT` | either direction. Abandon the update. |
+| `0x24` | `OTA_STATUS` | dongle → controller. Bytes written, and the state. |
 
 Control kinds start at `0x10` so a reader can tell the classes apart by
 magnitude, and the split is enforced by a test: an overlap would route a config
 message into the pointer path.
+
+## Firmware updates stay inside version 3
+
+The update kinds were added without bumping the version byte, and that is
+deliberate rather than lazy. The dongle rejects any frame whose version is not
+exactly its own, so a controller that bumped to 4 could not open a
+conversation with the firmware it was trying to replace — the update path would
+work on every dongle except the ones that needed it.
+
+An older build answers `OTA_BEGIN` with `BAD_REQUEST`, which the controller
+reports as "this firmware cannot be updated over the wire, use the cable".
+
+The image is described before it is sent:
+
+```text
+OTA_BEGIN   0..4    image length (u32)
+            4..36   SHA-256 of the image
+```
+
+The digest goes first so an image the dongle was never going to accept is
+refused before a flash erase and thirty seconds of radio time have been spent
+receiving it.
+
+```text
+OTA_DATA    0..4    byte offset (u32)
+            4..     image bytes, at most 508
+```
+
+Every `OTA_DATA` is answered with an `OTA_STATUS`, so the reply is the flow
+control as much as the progress:
+
+```text
+OTA_STATUS  0..4    bytes written so far (u32)
+            4       state: 0 idle, 1 receiving, 2 verifying, 3 ready, 4 failed
+```
+
+Answering each chunk halves the theoretical throughput and is still the right
+trade. Without it the controller outruns the dongle's flash writes and
+overflows a reassembly buffer that has no allocator to grow. Over the cable the
+round trip is 0.3ms and the whole image takes a few seconds; over the air it is
+closer to a minute, which is a fine price for not having to find the cable.
+
+The offset is explicit because the dongle writes to flash sequentially and
+cannot seek. A chunk arriving out of order has to be refused, and it could not
+be refused if nothing said where it belonged.
+
+`OTA_END` carries no payload. The dongle checks the digest, stages the image,
+acks, and then reboots into it.
+
+## Updating over the air needs authorisation
+
+`OTA_BEGIN` is refused with `NOT_PERMITTED` unless it arrives over the cable or
+from a controller that has already been authorised. Writing firmware is a
+persistent compromise where typing is only a live one, so it is held to at
+least the standard that authorising a controller already is.
 
 ## The controller does not route
 

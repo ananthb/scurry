@@ -35,6 +35,8 @@
 #include "esp_gatt_common_api.h"
 #include "scurry_ctl_svc.h"
 #include "scurry_button.h"
+#include "scurry_display.h"
+#include "scurry_ota.h"
 
 /**
  * Brief:
@@ -155,6 +157,14 @@ static void scurry_conn_add(uint16_t conn_id, esp_bd_addr_t bda)
 
 static void scurry_conn_remove(esp_bd_addr_t bda)
 {
+    /* Belt and braces against the fault this function actually took: the HID
+       profile once announced a disconnect with a null param, and the address
+       derived from it reached memcmp here. Cheap, and a lost table entry is a
+       far better outcome than a reboot. */
+    if (bda == NULL) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: disconnect with no peer address; table left alone");
+        return;
+    }
     for (int i = 0; i < SCURRY_MAX_HOSTS; i++) {
         if (scurry_conn_used[i] &&
             memcmp(scurry_conn_bda[i], bda, sizeof(esp_bd_addr_t)) == 0) {
@@ -165,6 +175,13 @@ static void scurry_conn_remove(esp_bd_addr_t bda)
     }
 }
 static bool sec_conn = false;
+
+/* The six digits the stack generated for a bonding peer to confirm. Only ever
+   set while the pairing window has the IO capability raised -- the rest of the
+   time this device advertises no display and bonds Just Works, which is all a
+   mouse needs and all a target should be asked for. */
+static uint32_t scurry_passkey;
+static bool     scurry_passkey_valid;
 #define CHAR_DECLARATION_SIZE   (sizeof(uint8_t))
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
@@ -174,6 +191,10 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
    are tellable apart in a Bluetooth picker. Filled in by
    scurry_make_device_name() before the name is ever set. */
 static char HIDD_DEVICE_NAME[16] = "Scurry";
+
+/* The same address, kept rather than discarded: the display shows it, and it
+   is what somebody reads off the glass to put in scurry.toml. */
+static uint8_t scurry_mac[6];
 
 static void scurry_make_device_name(void)
 {
@@ -202,6 +223,7 @@ static void scurry_make_device_name(void)
     }
     id[4] = '\0';
 
+    memcpy(scurry_mac, mac, sizeof(scurry_mac));
     snprintf(HIDD_DEVICE_NAME, sizeof(HIDD_DEVICE_NAME), "Scurry %s", id);
     ESP_LOGI(HID_DEMO_TAG, "scurry: advertising as \"%s\" (mac %02x:%02x:%02x:%02x:%02x:%02x)",
              HIDD_DEVICE_NAME, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -286,9 +308,16 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
         case ESP_HIDD_EVENT_BLE_DISCONNECT: {
             sec_conn = false;
             ESP_LOGI(HID_DEMO_TAG, "ESP_HIDD_EVENT_BLE_DISCONNECT");
-            scurry_conn_remove(param->disconnect.remote_bda);
-            scurry_controller_gone(param->disconnect.remote_bda);
-            scurry_ctl_svc_on_disconnect(param->disconnect.remote_bda);
+            /* The profile supplies the peer now. Guarded anyway, because the
+               version that did not took the dongle down rather than lose one
+               entry, and this callback is reached from a stack we do not own. */
+            if (param != NULL) {
+                scurry_conn_remove(param->disconnect.remote_bda);
+                scurry_controller_gone(param->disconnect.remote_bda);
+                scurry_ctl_svc_on_disconnect(param->disconnect.remote_bda);
+            } else {
+                ESP_LOGW(HID_DEMO_TAG, "scurry: disconnect event carried no peer");
+            }
             if (scurry_total_conns > 0) {
                 scurry_total_conns--;
             }
@@ -333,6 +362,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 (bd_addr[4] << 8) + bd_addr[5]);
         ESP_LOGI(HID_DEMO_TAG, "address type = %d", param->ble_security.auth_cmpl.addr_type);
         ESP_LOGI(HID_DEMO_TAG, "pair status = %s",param->ble_security.auth_cmpl.success ? "success" : "fail");
+        /* Whatever the outcome, the digits are spent: shown for a bond that
+           has now either happened or failed. Leaving them up would put a dead
+           passkey on the screen for the rest of the window. */
+        scurry_passkey_valid = false;
         if (param->ble_security.auth_cmpl.success) {
             sec_conn = true;
             ESP_LOGI(HID_DEMO_TAG, "secure connection established.");
@@ -340,6 +373,15 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             ESP_LOGE(HID_DEMO_TAG, "pairing failed, reason = 0x%x",
                      param->ble_security.auth_cmpl.fail_reason);
         }
+        break;
+    /* The peer has been given six digits to confirm. Unreachable unless the
+       pairing window raised the IO capability, so its mere arrival means
+       somebody is standing at the dongle looking at the screen. */
+    case ESP_GAP_BLE_PASSKEY_NOTIF_EVT:
+        scurry_passkey = param->ble_security.key_notif.passkey;
+        scurry_passkey_valid = true;
+        ESP_LOGI(HID_DEMO_TAG, "scurry: passkey %06lu -- shown on the dongle",
+                 (unsigned long)scurry_passkey);
         break;
     default:
         break;
@@ -365,7 +407,12 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_MAGIC        0x53
 #define SCURRY_VERSION      3
 #define SCURRY_HEADER_LEN   8
-#define SCURRY_MAX_PAYLOAD  256
+/* The protocol's cap, and it must be the protocol's cap. This read 256 while
+   doc/protocol.md and scurry-proto both said 512; no config payload is large
+   enough to have exposed the difference, so it sat there being wrong for free.
+   An OTA chunk is not that forgiving. Five framers at 520 bytes is 2.6KB of
+   the ~400KB on this part. */
+#define SCURRY_MAX_PAYLOAD  512
 
 #define SCURRY_KIND_MOUSE       0x01
 #define SCURRY_KIND_KEY         0x02
@@ -381,6 +428,13 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_KIND_GET_WIRELESS 0x16
 #define SCURRY_KIND_WIRELESS     0x17
 #define SCURRY_KIND_SET_WIRELESS 0x18
+#define SCURRY_KIND_GET_FIRMWARE 0x19
+#define SCURRY_KIND_FIRMWARE     0x1a
+#define SCURRY_KIND_OTA_BEGIN    0x20
+#define SCURRY_KIND_OTA_DATA     0x21
+#define SCURRY_KIND_OTA_END      0x22
+#define SCURRY_KIND_OTA_ABORT    0x23
+#define SCURRY_KIND_OTA_STATUS   0x24
 
 /* SET_WIRELESS operations. */
 #define SCURRY_WIRELESS_FORGET 0
@@ -390,6 +444,8 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_ACK_BAD_REQUEST     1
 #define SCURRY_ACK_INVALID_LAYOUT  2
 #define SCURRY_ACK_STORAGE_FAILED  3
+#define SCURRY_ACK_NOT_PERMITTED   4
+#define SCURRY_ACK_OTA_FAILED      5
 
 #define SCURRY_NVS_NAMESPACE  "scurry"
 #define SCURRY_NVS_KEY_LAYOUT "layout"
@@ -929,13 +985,32 @@ static void scurry_handle_set_config(const uint8_t *p, uint16_t len)
 #define SCURRY_PAIR_PRESSES 3
 #define SCURRY_PAIR_WINDOW_S 60
 
-/* The button is the whole ceremony on this hardware: no display, so there is
- * nothing to show and nothing to compare. Pressing it is the assertion that
- * whoever turns up next is the owner, which is worth exactly as much as
- * physical access to the dongle -- and that is the same thing the cable was
- * worth when it was the only path. */
+/* The button carries three meanings now, told apart by how many presses
+ * arrive in one burst. They are ordered by consequence, and so is the effort:
+ * the more a press can cost you, the more of them it takes.
+ *
+ * One turns the carousel -- identity, links, back again. It has to stay that
+ * harmless, because a single press is exactly what somebody does to an
+ * unfamiliar button.
+ *
+ * Two summons the Bluetooth address, which is read-only and merely a thing you
+ * came to look up.
+ *
+ * Three opens the pairing window. With a screen fitted that is no longer the
+ * whole ceremony -- the peer is shown six digits it must confirm -- but the
+ * press is still what asserts that whoever turns up next is the owner, and
+ * that assertion is worth exactly as much as physical access to the dongle.
+ * Which is the same thing the cable was worth when it was the only path. */
 static void scurry_on_button(int presses)
 {
+    if (presses == 1) {
+        scurry_display_next();
+        return;
+    }
+    if (presses == 2) {
+        scurry_display_show_mac();
+        return;
+    }
     if (presses < SCURRY_PAIR_PRESSES) {
         return;
     }
@@ -1014,6 +1089,125 @@ static void scurry_handle_set_wireless(const uint8_t *p, uint16_t len)
     }
 }
 
+/* Report what is running, and whether it can be replaced. The controller asks
+   this before it decides anything: an older build with a single app slot says
+   so here rather than failing a third of the way through a transfer. */
+static void scurry_send_firmware(void)
+{
+    uint8_t buf[1 + 32] = {0};
+    buf[0] = (uint8_t)((scurry_ota_supported() ? 1 : 0) |
+                       (scurry_ota_pending_verify() ? 2 : 0));
+    const char *v = scurry_ota_running_version();
+    size_t n = strnlen(v, 32);
+    memcpy(buf + 1, v, n);
+    scurry_reply(SCURRY_KIND_FIRMWARE, buf, sizeof(buf));
+}
+
+static void scurry_send_ota_status(void)
+{
+    uint8_t buf[5];
+    uint32_t received = 0;
+    uint8_t state = 0;
+    scurry_ota_progress(&received, &state);
+    buf[0] = (uint8_t)(received & 0xFF);
+    buf[1] = (uint8_t)((received >> 8) & 0xFF);
+    buf[2] = (uint8_t)((received >> 16) & 0xFF);
+    buf[3] = (uint8_t)((received >> 24) & 0xFF);
+    buf[4] = state;
+    scurry_reply(SCURRY_KIND_OTA_STATUS, buf, sizeof(buf));
+}
+
+/* Writing firmware is held to at least the standard that authorising a
+   controller already is, and for the same reason turned up one notch: a
+   controller that can type is a live compromise, one that can flash is a
+   permanent one. Over the cable means somebody is standing here. Over the air
+   means they were, once, and pinned this controller then. Anything else is
+   refused outright rather than merely misunderstood, which is what separates
+   NOT_PERMITTED from BAD_REQUEST. */
+static bool scurry_ota_source_allowed(void)
+{
+    if (scurry_reply_src == SCURRY_SRC_USB) {
+        return true;
+    }
+    int slot = scurry_reply_src - 1;
+    esp_bd_addr_t bda;
+    return slot >= 0 && scurry_ctl_svc_slot_bda(slot, bda) &&
+           scurry_ctl_svc_is_pinned(bda);
+}
+
+static void scurry_handle_ota_begin(const uint8_t *p, uint16_t len)
+{
+    if (!scurry_ota_source_allowed()) {
+        ESP_LOGW(HID_DEMO_TAG, "scurry: refusing a firmware image from an unauthorised source");
+        scurry_send_ack(SCURRY_ACK_NOT_PERMITTED);
+        return;
+    }
+    if (len < 4 + 32) {
+        scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
+        return;
+    }
+    uint32_t total = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    scurry_send_ack(scurry_ota_begin(total, p + 4));
+}
+
+static void scurry_handle_ota_data(const uint8_t *p, uint16_t len)
+{
+    if (!scurry_ota_source_allowed()) {
+        scurry_send_ack(SCURRY_ACK_NOT_PERMITTED);
+        return;
+    }
+    if (len < 4) {
+        scurry_send_ack(SCURRY_ACK_BAD_REQUEST);
+        return;
+    }
+    uint32_t off = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                   ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    uint8_t rc = scurry_ota_write(off, p + 4, (size_t)(len - 4));
+    if (rc != SCURRY_ACK_OK) {
+        scurry_send_ack(rc);
+        return;
+    }
+    /* The reply to a chunk is the progress, not a bare ack: it is the flow
+       control, and it costs nothing to make it say something useful. */
+    scurry_send_ota_status();
+}
+
+/* Long enough for the ack to reach the controller and for a person to read
+   "done" on the screen. A reboot inside the handler would cut the reply off
+   mid-write and leave the controller reporting a failure for an update that
+   in fact succeeded. */
+#define SCURRY_OTA_REBOOT_MS 1500
+
+static void scurry_ota_reboot(void *arg)
+{
+    (void)arg;
+    esp_restart();
+}
+
+static void scurry_handle_ota_end(void)
+{
+    if (!scurry_ota_source_allowed()) {
+        scurry_send_ack(SCURRY_ACK_NOT_PERMITTED);
+        return;
+    }
+    uint8_t rc = scurry_ota_end();
+    scurry_send_ack(rc);
+    if (rc != SCURRY_ACK_OK) {
+        return;
+    }
+    const esp_timer_create_args_t args = {
+        .callback = scurry_ota_reboot,
+        .name = "scurry_ota_boot",
+    };
+    esp_timer_handle_t t;
+    if (esp_timer_create(&args, &t) == ESP_OK) {
+        esp_timer_start_once(t, SCURRY_OTA_REBOOT_MS * 1000);
+    } else {
+        esp_restart();
+    }
+}
+
 static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, uint16_t len,
                           int src)
 {
@@ -1059,6 +1253,22 @@ static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, ui
         break;
     case SCURRY_KIND_SET_WIRELESS:
         scurry_handle_set_wireless(payload, len);
+        break;
+    case SCURRY_KIND_GET_FIRMWARE:
+        scurry_send_firmware();
+        break;
+    case SCURRY_KIND_OTA_BEGIN:
+        scurry_handle_ota_begin(payload, len);
+        break;
+    case SCURRY_KIND_OTA_DATA:
+        scurry_handle_ota_data(payload, len);
+        break;
+    case SCURRY_KIND_OTA_END:
+        scurry_handle_ota_end();
+        break;
+    case SCURRY_KIND_OTA_ABORT:
+        scurry_ota_abort();
+        scurry_send_ack(SCURRY_ACK_OK);
         break;
     default:
         ESP_LOGD(HID_DEMO_TAG, "scurry: unhandled kind 0x%02x", kind);
@@ -1250,6 +1460,55 @@ void scurry_reader_task(void *pvParameters)
 }
 
 
+_Static_assert(SCURRY_MAX_HOSTS == SCURRY_DISPLAY_MAX_NODES,
+               "the link screen draws one row per host slot");
+
+/* Gather everything the screens show, in one pass.
+ *
+ * Runs on the display task rather than being pushed from the BLE callbacks.
+ * Pushing would put I2C writes -- which block for milliseconds -- inside the
+ * Bluedroid callback thread, and a stall there costs connection events and so
+ * costs pointer latency. The screen is the last thing that should be allowed
+ * to slow the mouse down.
+ *
+ * Nothing is locked. Every field is a single aligned load of something a
+ * callback stores with a single aligned store, and the worst a race can
+ * produce is one 200ms frame showing a slot that has just this instant gone
+ * away. A mutex shared with the pointer path would be a real cost paid for a
+ * stale pixel. */
+static void scurry_display_poll(scurry_display_state_t *out)
+{
+    out->name = HIDD_DEVICE_NAME;
+    memcpy(out->mac, scurry_mac, sizeof(out->mac));
+
+    out->links = scurry_conn_count();
+    out->max_links = SCURRY_MAX_HOSTS;
+    out->focus_node = scurry_focus_node;
+    for (int i = 0; i < SCURRY_DISPLAY_MAX_NODES; i++) {
+        out->node_up[i] = scurry_conn_used[i];
+        /* The last two bytes only: four hex digits is what fits beside a node
+           number, and the tail is the half that differs between machines --
+           the head is an OUI shared by every board from the same vendor. */
+        out->node_tail[i][0] = scurry_conn_bda[i][4];
+        out->node_tail[i][1] = scurry_conn_bda[i][5];
+
+        out->node_name[i][0] = '\0';
+        if (out->node_up[i]) {
+            scurry_layout_name_for_node((uint8_t)(i + 1), (uint8_t *)out->node_name[i],
+                                        sizeof(out->node_name[i]));
+        }
+    }
+
+    out->driver = scurry_driver;
+    out->pairing_left_s = scurry_ctl_svc_pairing_remaining();
+    out->passkey_valid = scurry_passkey_valid;
+    out->passkey = scurry_passkey;
+
+    uint32_t received = 0;
+    scurry_ota_progress(&received, &out->ota_state);
+    out->ota_percent = scurry_ota_percent();
+}
+
 void app_main(void)
 {
     esp_err_t ret;
@@ -1342,4 +1601,15 @@ void app_main(void)
 
     xTaskCreate(&scurry_reader_task, "scurry_rx", 4096, NULL, 5, NULL);
     scurry_button_start(SCURRY_BUTTON_GPIO, scurry_on_button);
+
+    /* Last, because every value it puts on the glass has to exist first. A
+       board without a panel logs one line and carries on headless -- the same
+       image is flashed to both, and losing the mouse because a screen is
+       missing would be a poor trade for a status readout. */
+    scurry_display_start(scurry_display_poll);
+
+    /* If this image arrived over the wire it is on probation until it has
+       stayed up a while. Started last, so "stayed up" means everything above
+       came up too. */
+    scurry_ota_start_self_check();
 }

@@ -5,6 +5,8 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "esp_gap_ble_api.h"
+
 #include "scurry_ctl_svc.h"
 
 #define TAG "SCURRY_CTL"
@@ -179,9 +181,66 @@ static bool pairing_open(void)
     return pairing_until_us != 0 && esp_timer_get_time() < pairing_until_us;
 }
 
+/* The dongle has a screen now, so the passkey this header described in the
+ * abstract is real: raise the IO capability while the window is open and
+ * bonding becomes a six-digit comparison instead of Just Works.
+ *
+ * It has to come back down again. The capability is a device-wide security
+ * parameter -- one setting, not one per peer -- so a window left raised would
+ * put a passkey prompt in front of the next target that tried to bond, which
+ * is a mouse being asked to type. Raised on open, lowered on close, and the
+ * window is the only thing that touches it.
+ *
+ * The window can also close by simply running out, and that is why there is a
+ * timer here rather than a deadline evaluated lazily on each read. An expiry
+ * nobody happens to observe would leave the capability raised indefinitely --
+ * exactly the failure this is trying to avoid, arrived at by omission. */
+static esp_timer_handle_t pairing_timer;
+static bool iocap_raised;
+
+static void pairing_set_iocap(bool raised)
+{
+    if (raised == iocap_raised) {
+        return;
+    }
+    esp_ble_io_cap_t iocap = raised ? ESP_IO_CAP_OUT : ESP_IO_CAP_NONE;
+    if (esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap,
+                                       sizeof(uint8_t)) != ESP_OK) {
+        ESP_LOGW(TAG, "could not %s the IO capability", raised ? "raise" : "lower");
+        return;
+    }
+    iocap_raised = raised;
+    ESP_LOGI(TAG, "IO capability %s", raised ? "DisplayOnly" : "NoInputNoOutput");
+}
+
+static void pairing_expired(void *arg)
+{
+    (void)arg;
+    scurry_ctl_svc_close_pairing();
+}
+
 void scurry_ctl_svc_open_pairing(uint32_t seconds)
 {
     pairing_until_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+
+    if (pairing_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = pairing_expired,
+            .name = "scurry_pair",
+        };
+        if (esp_timer_create(&args, &pairing_timer) != ESP_OK) {
+            ESP_LOGW(TAG, "no timer for the pairing window: it will still stop "
+                          "authorising on time, but the passkey capability "
+                          "would linger past it");
+        }
+    }
+    if (pairing_timer != NULL) {
+        /* A second open restarts the clock rather than stacking on the first. */
+        esp_timer_stop(pairing_timer);
+        esp_timer_start_once(pairing_timer, (uint64_t)seconds * 1000000);
+    }
+
+    pairing_set_iocap(true);
     ESP_LOGI(TAG, "pairing window open for %us -- the next controller to turn up is authorised",
              (unsigned)seconds);
 }
@@ -190,6 +249,10 @@ void scurry_ctl_svc_close_pairing(void)
 {
     if (pairing_until_us != 0) {
         pairing_until_us = 0;
+        if (pairing_timer != NULL) {
+            esp_timer_stop(pairing_timer);
+        }
+        pairing_set_iocap(false);
         ESP_LOGI(TAG, "pairing window closed");
     }
 }
@@ -206,7 +269,7 @@ void scurry_ctl_svc_forget(void)
 {
     pin_count = 0;
     memset(pins, 0, sizeof(pins));
-    pairing_until_us = 0;
+    scurry_ctl_svc_close_pairing();
     memset(conns, 0, sizeof(conns));
     pins_save();
     ESP_LOGI(TAG, "all wireless controllers forgotten");

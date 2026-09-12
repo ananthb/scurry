@@ -62,23 +62,30 @@ void scurry_ctl_svc_on_disconnect(esp_bd_addr_t bda);
 
 /* Authorisation.
  *
- * Bonding here is Just Works -- the dongle has no display or keypad, so the
- * pairing has no man-in-the-middle protection and anything in radio range can
- * bond with it. That is acceptable for a mouse. It is not acceptable for a link
- * that can type, so an encrypted connection is necessary but not sufficient:
- * the controller's address must also have been pinned, and pinning only happens
- * inside a window. The window opens two ways, and both of them mean somebody is
- * standing at the dongle: a triple press of its button, or a request over the
- * cable, which is refused if it arrives over the air.
+ * Outside a pairing window this device advertises no display and bonds Just
+ * Works, which has no man-in-the-middle protection: anything in radio range
+ * can bond with it. That is acceptable for a mouse. It is not acceptable for
+ * a link that can type, so an encrypted connection is necessary but not
+ * sufficient: the controller's address must also have been pinned, and pinning
+ * only happens inside a window. The window opens two ways, and both of them
+ * mean somebody is standing at the dongle: a triple press of its button, or a
+ * request over the cable, which is refused if it arrives over the air.
  *
- * Physical access is therefore still what grants control, exactly as it was
- * when the cable was the only path.
+ * Physical access is therefore what grants control, exactly as it was when the
+ * cable was the only path.
  *
- * On hardware with a display this becomes a real passkey: show six digits and
- * make the controller prove it can see them. That needs the device's IO
- * capability raised to DisplayOnly, which is a global security parameter -- so
- * it has to be raised when the window opens and lowered again when it closes,
- * or every target would start being asked to type a code at a mouse. */
+ * On a board with the 0.42" OLED fitted the window adds a real passkey on top
+ * of that: six digits on the glass that the controller must prove it can see.
+ * The IO capability has to be raised to DisplayOnly for it, and that is a
+ * global security parameter rather than a per-peer one -- so it is raised when
+ * the window opens and lowered again when it closes, and the window is the
+ * only thing that moves it. Were it left raised, the next target to bond would
+ * be asked to type a code at a mouse.
+ *
+ * The consequence worth knowing: a target that happens to bond during those
+ * sixty seconds gets a passkey prompt it would not otherwise have seen. That
+ * is the price of one device-wide setting, and sixty seconds is the whole of
+ * the exposure. See scurry_display.h. */
 void scurry_ctl_svc_open_pairing(uint32_t seconds);
 void scurry_ctl_svc_close_pairing(void);
 /* Seconds left in the pairing window, 0 when closed. */

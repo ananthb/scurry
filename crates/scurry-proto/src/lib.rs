@@ -129,6 +129,218 @@ pub mod kind {
     /// authorising a new controller is exactly the power an attacker would
     /// want, so it takes physical access.
     pub const SET_WIRELESS: u8 = 0x18;
+
+    /// Controller -> dongle: what firmware are you running?
+    pub const GET_FIRMWARE: u8 = 0x19;
+    /// Dongle -> controller: see [`super::FirmwareInfo`].
+    ///
+    /// The controller needs this before it can decide anything about
+    /// updating: whether the running build can even take an update, and what
+    /// version it is, so a release can be compared against it rather than
+    /// pushed blindly.
+    pub const FIRMWARE: u8 = 0x1a;
+
+    /// Controller -> dongle: begin a firmware update. See [`super::OtaBegin`].
+    ///
+    /// The update kinds stay inside version 3 rather than bumping it, and the
+    /// reason is a chicken and egg: the dongle rejects any frame whose version
+    /// byte is not its own, so a controller that bumped the version could not
+    /// talk to the very firmware it was trying to replace. An older build
+    /// answers `OTA_BEGIN` with `BAD_REQUEST`, which says "not this way, use
+    /// the cable" clearly enough.
+    pub const OTA_BEGIN: u8 = 0x20;
+    /// Controller -> dongle: one chunk of the image. See [`super::OtaChunk`].
+    pub const OTA_DATA: u8 = 0x21;
+    /// Controller -> dongle: the image is complete. Verify it, and if it is
+    /// good, boot it next.
+    pub const OTA_END: u8 = 0x22;
+    /// Either direction: abandon the update in progress.
+    pub const OTA_ABORT: u8 = 0x23;
+    /// Dongle -> controller: how far the update has got. See
+    /// [`super::OtaStatus`].
+    ///
+    /// Sent in reply to every [`OTA_DATA`], which makes it the flow control as
+    /// well as the progress report. Without a reply per chunk the controller
+    /// would outrun the dongle's flash writes and overflow a reassembly
+    /// buffer it has no allocator to grow.
+    pub const OTA_STATUS: u8 = 0x24;
+}
+
+/// How long a firmware version string may be, NUL-padded on the wire.
+pub const FIRMWARE_VERSION_LEN: usize = 32;
+
+/// The most image bytes one [`kind::OTA_DATA`] can carry.
+///
+/// The frame's payload cap less the four-byte offset that precedes the data.
+/// The offset is carried explicitly rather than implied by arrival order
+/// because the dongle writes to flash sequentially and cannot seek: a chunk
+/// that turns up out of order has to be refused, and it cannot be refused if
+/// nobody said where it belonged.
+pub const OTA_CHUNK_MAX: usize = MAX_PAYLOAD - 4;
+
+/// Payload of [`kind::FIRMWARE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwareInfo {
+    /// This build can accept an update over the wire at all. False for a
+    /// firmware flashed into a single-app partition layout, which has nowhere
+    /// to put a second image.
+    pub ota_capable: bool,
+    /// The running image has not yet confirmed itself, so the bootloader will
+    /// revert to the previous one if it is reset before it does.
+    pub pending_verify: bool,
+    /// Version string, as built. Empty if the build did not set one.
+    pub version: [u8; FIRMWARE_VERSION_LEN],
+}
+
+impl Default for FirmwareInfo {
+    fn default() -> Self {
+        Self {
+            ota_capable: false,
+            pending_verify: false,
+            version: [0u8; FIRMWARE_VERSION_LEN],
+        }
+    }
+}
+
+impl FirmwareInfo {
+    pub const WIRE_LEN: usize = 1 + FIRMWARE_VERSION_LEN;
+
+    pub fn encode_into(&self, out: &mut [u8]) {
+        out[0] = (self.ota_capable as u8) | ((self.pending_verify as u8) << 1);
+        out[1..1 + FIRMWARE_VERSION_LEN].copy_from_slice(&self.version);
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let mut version = [0u8; FIRMWARE_VERSION_LEN];
+        version.copy_from_slice(&buf[1..1 + FIRMWARE_VERSION_LEN]);
+        Some(Self {
+            ota_capable: buf[0] & 1 != 0,
+            pending_verify: buf[0] & 2 != 0,
+            version,
+        })
+    }
+
+    /// The version as text, with the NUL padding trimmed.
+    pub fn version_str(&self) -> &str {
+        let end = self
+            .version
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(FIRMWARE_VERSION_LEN);
+        core::str::from_utf8(&self.version[..end]).unwrap_or("")
+    }
+
+    /// Build one from a string, truncating rather than failing: a version too
+    /// long to fit is still worth reporting in part, and this is a diagnostic
+    /// rather than something the protocol branches on.
+    pub fn with_version(mut self, v: &str) -> Self {
+        let bytes = v.as_bytes();
+        let n = core::cmp::min(bytes.len(), FIRMWARE_VERSION_LEN);
+        self.version = [0u8; FIRMWARE_VERSION_LEN];
+        self.version[..n].copy_from_slice(&bytes[..n]);
+        self
+    }
+}
+
+/// Payload of [`kind::OTA_BEGIN`].
+///
+/// The digest is sent up front rather than at the end so the dongle can reject
+/// an image it was never going to accept before spending thirty seconds of
+/// radio time and a flash erase on receiving it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtaBegin {
+    /// Total image length in bytes.
+    pub len: u32,
+    /// SHA-256 of the whole image.
+    pub sha256: [u8; 32],
+}
+
+impl OtaBegin {
+    pub const WIRE_LEN: usize = 4 + 32;
+
+    pub fn encode_into(&self, out: &mut [u8]) {
+        out[0..4].copy_from_slice(&self.len.to_le_bytes());
+        out[4..36].copy_from_slice(&self.sha256);
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&buf[4..36]);
+        Some(Self {
+            len: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            sha256,
+        })
+    }
+}
+
+/// The offset carried at the front of a [`kind::OTA_DATA`] payload.
+pub struct OtaChunk;
+
+impl OtaChunk {
+    /// Split a received payload into its offset and its bytes.
+    pub fn decode(buf: &[u8]) -> Option<(u32, &[u8])> {
+        if buf.len() < 4 {
+            return None;
+        }
+        let off = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        Some((off, &buf[4..]))
+    }
+
+    /// Write offset and data into `out`, returning how much of it was used.
+    pub fn encode_into(offset: u32, data: &[u8], out: &mut [u8]) -> usize {
+        out[0..4].copy_from_slice(&offset.to_le_bytes());
+        out[4..4 + data.len()].copy_from_slice(data);
+        4 + data.len()
+    }
+}
+
+/// States reported by [`kind::OTA_STATUS`].
+pub mod ota_state {
+    /// No update in progress.
+    pub const IDLE: u8 = 0;
+    /// Receiving chunks.
+    pub const RECEIVING: u8 = 1;
+    /// The image is complete and being checked.
+    pub const VERIFYING: u8 = 2;
+    /// Checked, staged, and about to be booted.
+    pub const READY: u8 = 3;
+    /// Abandoned. The running image is untouched.
+    pub const FAILED: u8 = 4;
+}
+
+/// Payload of [`kind::OTA_STATUS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OtaStatus {
+    /// How many bytes the dongle has written so far. The controller resumes
+    /// from here after an error rather than starting again.
+    pub received: u32,
+    /// One of [`ota_state`].
+    pub state: u8,
+}
+
+impl OtaStatus {
+    pub const WIRE_LEN: usize = 5;
+
+    pub fn encode_into(&self, out: &mut [u8]) {
+        out[0..4].copy_from_slice(&self.received.to_le_bytes());
+        out[4] = self.state;
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::WIRE_LEN {
+            return None;
+        }
+        Some(Self {
+            received: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            state: buf[4],
+        })
+    }
 }
 
 /// Operations carried by [`kind::SET_WIRELESS`].
@@ -145,6 +357,13 @@ pub mod ack {
     pub const BAD_REQUEST: u8 = 1;
     pub const INVALID_LAYOUT: u8 = 2;
     pub const STORAGE_FAILED: u8 = 3;
+    /// The request was understood and refused. Distinct from `BAD_REQUEST`,
+    /// which means it was not understood: a controller that gets this one
+    /// should stop and tell somebody, not retry with different bytes.
+    pub const NOT_PERMITTED: u8 = 4;
+    /// A firmware update failed. The image is not booted and the previous one
+    /// is untouched.
+    pub const OTA_FAILED: u8 = 5;
 }
 
 /// Which screen edge a pointer crossed.

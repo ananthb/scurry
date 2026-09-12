@@ -533,9 +533,28 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
             break;
         }
         case ESP_GATTS_DISCONNECT_EVT: {
-			 if(hidd_le_env.hidd_cb != NULL) {
-                    (hidd_le_env.hidd_cb)(ESP_HIDD_EVENT_BLE_DISCONNECT, NULL);
-             }
+            /* The peer's address is right here, and this used to hand the
+               application a NULL instead.
+               
+               Two things went wrong with that. The application dereferences the
+               param to learn which peer left -- so the profile was handing it a
+               null pointer to walk into. And even had it survived, "which of the
+               four bonded targets just went away" is the entire question a
+               disconnect has to answer; without an address it cannot be
+               answered, the connection table keeps an entry for a machine that
+               is gone, and the pointer is still routed to it.
+
+               The crash hid because the application only reads the address once
+               a target is actually seated. With nothing connected the loop that
+               would have dereferenced it never runs, so the fault needed a live
+               connection before it would show -- and then took the whole dongle
+               down with it. Mirrors the connect case above. */
+            esp_hidd_cb_param_t cb_param = {0};
+            memcpy(cb_param.disconnect.remote_bda, param->disconnect.remote_bda,
+                   sizeof(esp_bd_addr_t));
+            if(hidd_le_env.hidd_cb != NULL) {
+                (hidd_le_env.hidd_cb)(ESP_HIDD_EVENT_BLE_DISCONNECT, &cb_param);
+            }
             hidd_clcb_dealloc(param->disconnect.conn_id);
             break;
         }

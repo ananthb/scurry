@@ -26,3 +26,19 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # in the pinned toolchain (ImportError: _PyIter_NextItem). Turning it off both
 # fixes the build and drops a few KB we were never going to use.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+
+# Firmware updates over the protocol link.
+#
+# The board has 4MB of flash and was configured for 2MB, so half of it was
+# simply invisible -- and two 1.5MB app slots do not fit in the half we were
+# admitting to.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Two app slots plus the otadata that says which one to boot. See partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# A freshly booted image is on probation until it says otherwise. Without this
+# a bad update over the air is unrecoverable without physically fetching the
+# dongle, which is the one situation the wireless link exists to avoid.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

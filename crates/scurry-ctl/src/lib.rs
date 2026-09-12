@@ -9,3 +9,4 @@ pub mod capture;
 pub mod config;
 pub mod ipc;
 pub mod transport;
+pub mod update;
