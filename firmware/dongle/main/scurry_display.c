@@ -41,6 +41,14 @@ static const char *TAG = "SCURRY_DISP";
 #define DISP_PAGES      (DISP_H / 8)
 #define DISP_COL_OFFSET 28
 
+/* Rotated 180 degrees, because the panel is mounted upside down in the case.
+ * The controller does both flips on the way out of RAM, so the framebuffer
+ * and the centring arithmetic are unchanged. Both are needed: one alone
+ * mirrors rather than rotates. DISP_COL_OFFSET is unaffected -- the visible
+ * window is centred, so it is 28 from either end. */
+#define DISP_SEG_REMAP  0xA0
+#define DISP_COM_SCAN   0xC0
+
 /* Twelve characters per line: 72 / 6, where 6 is a 5-pixel glyph plus one
    column of gap. Five lines, one per page. */
 #define DISP_COLS       (DISP_W / 6)
@@ -741,8 +749,8 @@ static const uint8_t DISP_INIT[] = {
     0x20, 0x02,        /* page addressing: disp_flush sets the page and column
                           explicitly per row, which horizontal mode would then
                           auto-increment past */
-    0xA1,              /* segment remap */
-    0xC8,              /* COM scan direction, reversed to match */
+    DISP_SEG_REMAP,    /* the 180 rotation; change these two as a pair */
+    DISP_COM_SCAN,
     0xDA, 0x12,        /* alternative COM pin config, as this panel is wired */
     0x81, 0xAF,        /* contrast */
     0xD9, 0x22,        /* pre-charge period */
