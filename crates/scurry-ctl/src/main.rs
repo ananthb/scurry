@@ -30,6 +30,9 @@ commands:
   firmware            show the dongle's firmware version and the latest release
   flash [--file F]    update the dongle's firmware, from the latest release
                       or from a local image
+  provision [--port P] [--file F]
+                      first flash of a blank board, over its ROM bootloader.
+                      Erases the board, including any bonds and layout
 
 options:
   --wireless          reach the dongle over BLE instead of the cable
@@ -74,6 +77,7 @@ fn main() -> Result<()> {
         "forget-controller" => forget_controller(),
         "firmware" => firmware(),
         "flash" => flash(&args[1..]),
+        "provision" => provision(&args[1..]),
         _ => usage(),
     }
 }
@@ -236,6 +240,70 @@ fn flash(args: &[String]) -> Result<()> {
         }
     })?;
     eprintln!("\rdone. The dongle is rebooting into the new firmware.        ");
+    Ok(())
+}
+
+fn provision(args: &[String]) -> Result<()> {
+    let mut file: Option<String> = None;
+    let mut port: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                file = Some(args.get(i + 1).cloned().unwrap_or_else(|| usage()));
+                i += 2;
+            }
+            "--port" => {
+                port = Some(args.get(i + 1).cloned().unwrap_or_else(|| usage()));
+                i += 2;
+            }
+            _ => usage(),
+        }
+    }
+
+    let port = match port {
+        Some(p) => p,
+        None => {
+            let found = scurry_ctl::provision::candidates()?;
+            match found.len() {
+                0 => bail!("no board found. Plug one in, or name the port with --port"),
+                1 => found[0].port.clone(),
+                _ => {
+                    let list: Vec<&str> = found.iter().map(|c| c.port.as_str()).collect();
+                    bail!(
+                        "more than one board is plugged in; name one with --port:\n  {}",
+                        list.join("\n  ")
+                    );
+                }
+            }
+        }
+    };
+
+    let (image, what) = match &file {
+        Some(path) => (
+            std::fs::read(path).with_context(|| format!("reading {path}"))?,
+            path.clone(),
+        ),
+        None => {
+            eprintln!("checking for the latest release...");
+            let rel = scurry_ctl::update::latest_release()?;
+            eprintln!("downloading {} ({})...", rel.tag, scurry_ctl::provision::FACTORY_ASSET);
+            (scurry_ctl::update::download_factory(&rel)?, rel.tag)
+        }
+    };
+
+    eprintln!("writing {what} ({} bytes) to the board on {port}", image.len());
+    eprintln!("this erases the board: any bonds and stored layout go with it.");
+
+    let mut last_pct = u32::MAX;
+    scurry_ctl::provision::provision(&port, &image, &mut |sent, total| {
+        let pct = sent * 100 / total.max(1);
+        if pct != last_pct {
+            last_pct = pct;
+            eprint!("\r  {pct}% ({sent}/{total} bytes)");
+        }
+    })?;
+    eprintln!("\rdone. The board is rebooting into scurry.               ");
     Ok(())
 }
 

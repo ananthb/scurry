@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use scurry_ctl::ipc::Client;
+use scurry_ctl::provision;
 use scurry_ctl::update::{self, Release};
 use scurry_proto::FirmwareInfo;
 
@@ -48,6 +49,9 @@ pub enum Progress {
 
 pub struct FirmwarePane {
     info: Option<FirmwareInfo>,
+    /// Ports with a board on them that is not the dongle this app is using.
+    /// Refreshed on demand, since plugging one in is a deliberate act.
+    blank_ports: Vec<provision::Candidate>,
     latest: Option<Release>,
     /// Set when the release check failed, so the pane can say why rather than
     /// silently offering nothing.
@@ -60,6 +64,7 @@ impl Default for FirmwarePane {
     fn default() -> Self {
         Self {
             info: None,
+            blank_ports: Vec::new(),
             latest: None,
             check_error: None,
             local_path: String::new(),
@@ -79,6 +84,7 @@ impl FirmwarePane {
     /// Ask the dongle what it runs, and GitHub what it could run.
     pub fn refresh(&mut self) {
         self.check_error = None;
+        self.rescan_ports();
         match Client::connect().and_then(|c| {
             let mut link = SocketLink(c);
             update::firmware_info(&mut link)
@@ -96,12 +102,41 @@ impl FirmwarePane {
         }
     }
 
+    /// Look for boards that are not already running scurry.
+    fn rescan_ports(&mut self) {
+        self.blank_ports = provision::candidates().unwrap_or_default();
+    }
+
     fn start(&mut self, source: Source) {
         let progress = Arc::clone(&self.progress);
         *progress.lock().unwrap() = Progress::Working("Preparing…".into());
 
         std::thread::spawn(move || {
+            let provisioning = matches!(source, Source::Provision { .. });
             let result = (|| -> anyhow::Result<()> {
+                if let Source::Provision { port, file } = source {
+                    let image = match file {
+                        Some(path) => {
+                            *progress.lock().unwrap() =
+                                Progress::Working("Reading the image…".into());
+                            std::fs::read(&path)
+                                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
+                        }
+                        None => {
+                            *progress.lock().unwrap() =
+                                Progress::Working("Finding the latest release…".into());
+                            let rel = update::latest_release()?;
+                            *progress.lock().unwrap() =
+                                Progress::Working(format!("Downloading {}…", rel.tag));
+                            update::download_factory(&rel)?
+                        }
+                    };
+                    provision::provision(&port, &image, &mut |sent, total| {
+                        *progress.lock().unwrap() = Progress::Sending { sent, total };
+                    })?;
+                    return Ok(());
+                }
+
                 let image = match source {
                     Source::Release(rel) => {
                         *progress.lock().unwrap() =
@@ -113,6 +148,7 @@ impl FirmwarePane {
                         std::fs::read(&path)
                             .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?
                     }
+                    Source::Provision { .. } => unreachable!("handled above"),
                 };
 
                 let mut c = Client::connect()?;
@@ -126,12 +162,61 @@ impl FirmwarePane {
             })();
 
             *progress.lock().unwrap() = match result {
+                Ok(()) if provisioning => Progress::Done(
+                    "Flashed. The board is rebooting into scurry for the first time.".into(),
+                ),
                 Ok(()) => Progress::Done(
                     "Installed. The dongle is rebooting into the new firmware.".into(),
                 ),
                 Err(e) => Progress::Failed(format!("{e}")),
             };
         });
+    }
+
+    /// The section for a board that is not a dongle yet.
+    ///
+    /// Hidden when there is nothing to flash, since most of the time there is
+    /// not. A blank board cannot be updated over the protocol — it has no
+    /// partition table and nothing that answers — so this writes the whole
+    /// layout over the ROM bootloader instead.
+    fn provision_ui(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+
+        if self.blank_ports.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("No new board plugged in.");
+                if ui.button("Look again").clicked() {
+                    self.rescan_ports();
+                }
+            });
+            return;
+        }
+
+        ui.label("New board — not running scurry yet:");
+        let busy = self.busy();
+        let local = self.local_path.trim().to_string();
+        let mut chosen: Option<String> = None;
+
+        for board in &self.blank_ports {
+            ui.horizontal(|ui| {
+                ui.monospace(&board.port);
+                if let Some(product) = &board.product {
+                    ui.weak(product);
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Flash scurry onto it")).clicked() {
+                    chosen = Some(board.port.clone());
+                }
+            });
+        }
+
+        ui.weak(
+            "This erases the board: a dongle already in service loses its bonds and layout.              Uses the local image above when one is given, otherwise the latest release.",
+        );
+
+        if let Some(port) = chosen {
+            let file = (!local.is_empty()).then_some(local);
+            self.start(Source::Provision { port, file });
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -158,6 +243,8 @@ impl FirmwarePane {
                 if ui.button("Check again").clicked() {
                     self.refresh();
                 }
+                self.provision_ui(ui);
+                self.progress_ui(ui, ctx);
                 return;
             }
             Some(info) => {
@@ -229,6 +316,12 @@ impl FirmwarePane {
             }
         });
 
+        self.provision_ui(ui);
+
+        self.progress_ui(ui, ctx);
+    }
+
+    fn progress_ui(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let progress = self.progress.lock().unwrap().clone();
         match progress {
             Progress::Idle => {}
@@ -262,4 +355,7 @@ impl FirmwarePane {
 enum Source {
     Release(Release),
     File(String),
+    /// First flash of a blank board on this port, from the latest release or
+    /// a local image.
+    Provision { port: String, file: Option<String> },
 }

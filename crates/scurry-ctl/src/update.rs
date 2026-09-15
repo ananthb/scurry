@@ -48,6 +48,9 @@ pub trait Link {
 pub struct Release {
     pub tag: String,
     pub firmware_url: String,
+    /// The merged image that provisions a blank board. Absent on releases
+    /// that predate it.
+    pub factory_url: Option<String>,
     /// URL of the signed checksum manifest, when the release has one.
     pub checksums_url: Option<String>,
 }
@@ -87,6 +90,7 @@ pub fn latest_release() -> Result<Release> {
     Ok(Release {
         tag,
         firmware_url,
+        factory_url: find(crate::provision::FACTORY_ASSET),
         checksums_url: find("SHA256SUMS"),
     })
 }
@@ -117,26 +121,43 @@ fn get(url: &str) -> Result<Vec<u8>> {
 /// make this authentic rather than merely intact. That is a worthwhile next
 /// step and is not done here.
 pub fn download_firmware(release: &Release) -> Result<Vec<u8>> {
-    let image = get(&release.firmware_url)?;
+    download_asset(release, FIRMWARE_ASSET, &release.firmware_url)
+}
 
-    let Some(url) = &release.checksums_url else {
+/// Download the merged image that provisions a blank board, checked the same
+/// way.
+pub fn download_factory(release: &Release) -> Result<Vec<u8>> {
+    let url = release.factory_url.as_ref().ok_or_else(|| {
+        anyhow!(
+            "release {} has no {}; it predates provisioning from the app",
+            release.tag,
+            crate::provision::FACTORY_ASSET
+        )
+    })?;
+    download_asset(release, crate::provision::FACTORY_ASSET, url)
+}
+
+fn download_asset(release: &Release, name: &str, url: &str) -> Result<Vec<u8>> {
+    let image = get(url)?;
+
+    let Some(sums) = &release.checksums_url else {
         eprintln!("warning: release {} has no SHA256SUMS to check against", release.tag);
         return Ok(image);
     };
 
-    let manifest = get(url)?;
+    let manifest = get(sums)?;
     let manifest = String::from_utf8_lossy(&manifest);
     let want = manifest
         .lines()
         .find_map(|l| {
-            let (sum, name) = l.split_once("  ")?;
-            (name.trim() == FIRMWARE_ASSET).then(|| sum.trim().to_string())
+            let (sum, got) = l.split_once("  ")?;
+            (got.trim() == name).then(|| sum.trim().to_string())
         })
-        .ok_or_else(|| anyhow!("SHA256SUMS does not mention {FIRMWARE_ASSET}"))?;
+        .ok_or_else(|| anyhow!("SHA256SUMS does not mention {name}"))?;
 
     let got = hex(&Sha256::digest(&image));
     if got != want {
-        bail!("the downloaded firmware does not match the release checksum:\n  expected {want}\n  got      {got}");
+        bail!("the downloaded {name} does not match the release checksum:\n  expected {want}\n  got      {got}");
     }
     Ok(image)
 }

@@ -43,6 +43,7 @@ guess.
 | dongle BLE HID firmware | working: mouse and keyboard reach bonded targets |
 | 0.42" OLED status display | working: identity, links, pairing window, passkey |
 | firmware updates over the link | working: verified over the cable, onto a live dongle |
+| provisioning a blank board | working: verified over the cable, onto a new board |
 | WS2812 status LED | written, not yet verified on hardware |
 | wireless controller link | experimental; works, see [002](doc/experiments/002-wireless-control-link.md) |
 | Linux and Windows capture | not started |
@@ -126,6 +127,30 @@ Note that a dongle running firmware older than this has a single `factory`
 partition and nowhere to put a second image. It says so when asked, and needs
 one cable flash to gain the two-slot layout — after which it can update itself.
 NVS keeps its offset across that change, so bonds and the stored layout survive.
+
+### A board that has never run scurry
+
+An update writes the inactive app slot of firmware that is already running. A
+new board has no partition table and nothing that answers, so there is nothing
+to ask and nothing to ask it with. That first flash goes over the chip's ROM
+bootloader instead, and the app does it:
+
+```sh
+scurry-ctl provision            # finds the board, fetches the latest release
+scurry-ctl provision --file f.bin --port /dev/cu.usbmodem2101
+```
+
+The tray offers the same thing under **Firmware** when it sees a board that is
+not a dongle yet. Ports are told apart by asking: one that answers a ping is
+already a dongle and is left alone.
+
+What goes down is `scurry-dongle-esp32c3-factory.bin` — bootloader, partition
+table, otadata and app merged at their offsets — published with every release
+beside the app image. It erases the board, bonds and stored layout included, so
+it is for a blank board rather than one in service.
+
+A board that will not enter its bootloader on its own still needs BOOT held and
+RST tapped; after that one flash it updates itself like any other dongle.
 
 ### The status LED
 

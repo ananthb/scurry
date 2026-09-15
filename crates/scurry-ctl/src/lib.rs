@@ -8,5 +8,6 @@
 pub mod capture;
 pub mod config;
 pub mod ipc;
+pub mod provision;
 pub mod transport;
 pub mod update;
