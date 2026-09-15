@@ -45,6 +45,8 @@ buffer: it has no allocator to grow one.
 | `0x18` | `SET_WIRELESS` | controller → dongle. Open the pairing window, or revoke. |
 | `0x19` | `GET_FIRMWARE` | controller → dongle. |
 | `0x1a` | `FIRMWARE` | dongle → controller. Version, and whether it can be updated. |
+| `0x1b` | `GET_IDENTITY` | controller → dongle. |
+| `0x1c` | `IDENTITY` | dongle → controller. Which dongle this is: name and address. |
 | `0x20` | `OTA_BEGIN` | controller → dongle. Length and SHA-256 of an image. |
 | `0x21` | `OTA_DATA` | controller → dongle. One chunk, offset first. |
 | `0x22` | `OTA_END` | controller → dongle. Verify and stage the image. |

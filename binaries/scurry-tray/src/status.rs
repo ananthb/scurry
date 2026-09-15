@@ -11,7 +11,7 @@ use anyhow::Result;
 use scurry_ctl::config::Config;
 use scurry_ctl::ipc::{ack_message, Client, DaemonState};
 use scurry_ctl::transport::Dongle;
-use scurry_proto::{kind, SlotStatus};
+use scurry_proto::{kind, Identity, SlotStatus};
 
 /// How long one poll waits for the dongle before giving up on that round.
 const POLL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -37,6 +37,8 @@ pub enum Snapshot {
         focus: u8,
         screens: Vec<ScreenInfo>,
         slots: Vec<SlotStatus>,
+        /// `None` against firmware too old to answer.
+        identity: Option<Identity>,
     },
 }
 
@@ -79,6 +81,8 @@ pub fn spawn_poller(
         // a real answer replaces what is shown.
         let mut screens: Vec<ScreenInfo> = Vec::new();
         let mut slots: Vec<SlotStatus> = Vec::new();
+        // Asked once: it cannot change while the dongle is plugged in.
+        let mut identity: Option<Identity> = None;
 
         loop {
             let focus = state.focus.load(Ordering::Relaxed);
@@ -99,6 +103,14 @@ pub fn spawn_poller(
                 }
             }
 
+            if identity.is_none() {
+                let id =
+                    state.request(&link, kind::GET_IDENTITY, &[], kind::IDENTITY, POLL_TIMEOUT);
+                if let Ok((kind::IDENTITY, p)) = id {
+                    identity = Identity::decode(&p);
+                }
+            }
+
             let st = state.request(&link, kind::GET_STATUS, &[], kind::STATUS, POLL_TIMEOUT);
             if let Ok((kind::STATUS, p)) = st {
                 if !p.is_empty() {
@@ -114,11 +126,29 @@ pub fn spawn_poller(
             }
 
             if let Ok(mut cell) = out.lock() {
-                *cell = Snapshot::Ready { focus, screens: screens.clone(), slots: slots.clone() };
+                *cell = Snapshot::Ready {
+                    focus,
+                    screens: screens.clone(),
+                    slots: slots.clone(),
+                    identity: identity.clone(),
+                };
             }
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+/// Ask which dongle is plugged in, for the settings process.
+pub fn load_identity() -> Result<Identity> {
+    let mut c = Client::connect()?;
+    let (k, p) = c.request(kind::GET_IDENTITY, &[])?;
+    if k == kind::ACK {
+        anyhow::bail!("could not ask which dongle this is: {}", ack_message(&p));
+    }
+    if k != kind::IDENTITY {
+        anyhow::bail!("the app answered an identity request with a {k:#04x} message");
+    }
+    Identity::decode(&p).ok_or_else(|| anyhow::anyhow!("the identity reply was too short"))
 }
 
 /// Read the layout through the control socket, for the settings process.

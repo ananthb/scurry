@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use scurry_ctl::config::Config;
 use scurry_ctl::ipc::{ack_message, Client};
 use scurry_ctl::transport::{Dongle, Message};
-use scurry_proto::{ack, kind, wireless_op, SlotStatus, WirelessState};
+use scurry_proto::{ack, kind, wireless_op, Identity, SlotStatus, WirelessState};
 
 fn usage() -> ! {
     eprintln!(
@@ -363,7 +363,17 @@ fn test_move() -> Result<()> {
 }
 
 fn status() -> Result<()> {
-    let msg = open_link()?.request(kind::GET_STATUS, &[], kind::STATUS)?;
+    let mut link = open_link()?;
+
+    // Which dongle, before what is connected to it. Older firmware does not
+    // answer, which is not worth failing the command over.
+    if let Ok(msg) = link.request(kind::GET_IDENTITY, &[], kind::IDENTITY) {
+        if let Some(id) = Identity::decode(&msg.payload) {
+            println!("{} ({})", id.name_str(), id.mac_str());
+        }
+    }
+
+    let msg = link.request(kind::GET_STATUS, &[], kind::STATUS)?;
     if msg.payload.is_empty() {
         bail!("empty status payload");
     }

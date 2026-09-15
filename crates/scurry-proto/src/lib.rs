@@ -140,6 +140,11 @@ pub mod kind {
     /// pushed blindly.
     pub const FIRMWARE: u8 = 0x1a;
 
+    /// Controller -> dongle: which dongle are you?
+    pub const GET_IDENTITY: u8 = 0x1b;
+    /// Dongle -> controller: see [`super::Identity`].
+    pub const IDENTITY: u8 = 0x1c;
+
     /// Controller -> dongle: begin a firmware update. See [`super::OtaBegin`].
     ///
     /// The update kinds stay inside version 3 rather than bumping it, and the
@@ -242,6 +247,63 @@ impl FirmwareInfo {
         self.version = [0u8; FIRMWARE_VERSION_LEN];
         self.version[..n].copy_from_slice(&bytes[..n]);
         self
+    }
+}
+
+/// Payload of [`kind::IDENTITY`]: which dongle this is.
+///
+/// The name is derived from the address, so the two cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// Advertised name, e.g. "Scurry M4K2", NUL-padded.
+    pub name: [u8; NAME_LEN],
+    /// The board's Bluetooth address, most significant byte first.
+    pub mac: [u8; 6],
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Self { name: [0u8; NAME_LEN], mac: [0u8; 6] }
+    }
+}
+
+impl Identity {
+    pub const WIRE_LEN: usize = NAME_LEN + 6;
+
+    pub fn encode_into(&self, out: &mut [u8]) {
+        out[..NAME_LEN].copy_from_slice(&self.name);
+        out[NAME_LEN..Self::WIRE_LEN].copy_from_slice(&self.mac);
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let mut name = [0u8; NAME_LEN];
+        name.copy_from_slice(&buf[..NAME_LEN]);
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&buf[NAME_LEN..Self::WIRE_LEN]);
+        Some(Self { name, mac })
+    }
+
+    /// The full advertised name, with the NUL padding trimmed.
+    pub fn name_str(&self) -> &str {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(NAME_LEN);
+        core::str::from_utf8(&self.name[..end]).unwrap_or("")
+    }
+
+    /// Just the code: the four characters after "Scurry ". A name that does
+    /// not have that shape is returned whole.
+    pub fn code(&self) -> &str {
+        let name = self.name_str();
+        name.rsplit_once(' ').map(|(_, code)| code).unwrap_or(name)
+    }
+
+    /// The address as it appears in `scurry.toml`. Behind `std` because it
+    /// allocates and this crate is also built no_std for the firmware.
+    #[cfg(feature = "std")]
+    pub fn mac_str(&self) -> String {
+        self.mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
     }
 }
 
@@ -981,6 +1043,33 @@ mod tests {
         let mut buf = [0u8; SlotStatus::WIRE_LEN];
         s.encode_into(&mut buf);
         assert_eq!(SlotStatus::decode(&buf).unwrap(), s);
+    }
+
+    #[test]
+    fn identity_roundtrips_and_splits_off_the_code() {
+        let mut name = [0u8; NAME_LEN];
+        name[.."Scurry M4K2".len()].copy_from_slice(b"Scurry M4K2");
+        let id = Identity { name, mac: [0x14, 0x63, 0x93, 0x90, 0x01, 0xd4] };
+
+        let mut buf = [0u8; Identity::WIRE_LEN];
+        id.encode_into(&mut buf);
+        assert_eq!(Identity::decode(&buf).unwrap(), id);
+
+        assert_eq!(id.name_str(), "Scurry M4K2");
+        assert_eq!(id.code(), "M4K2");
+        assert_eq!(id.mac_str(), "14:63:93:90:01:d4");
+    }
+
+    #[test]
+    fn an_unexpected_identity_name_survives() {
+        let id = Identity::default();
+        assert_eq!(id.name_str(), "");
+        assert_eq!(id.code(), "");
+
+        let mut name = [0u8; NAME_LEN];
+        name[..7].copy_from_slice(b"unnamed");
+        let odd = Identity { name, ..Identity::default() };
+        assert_eq!(odd.code(), "unnamed");
     }
 
     #[test]

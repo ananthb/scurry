@@ -39,6 +39,9 @@ enum Tab {
 
 struct SettingsApp {
     tab: Tab,
+    /// Which dongle this window is editing, shown in the tab bar. Asked once
+    /// at startup; `None` when nothing is plugged in.
+    identity: Option<scurry_proto::Identity>,
     firmware: FirmwarePane,
     /// The firmware tab has not been opened yet, so nothing has been asked of
     /// the dongle or of GitHub.
@@ -54,6 +57,7 @@ impl SettingsApp {
     fn new() -> Self {
         let mut app = Self {
             tab: Tab::Layout,
+            identity: status::load_identity().ok(),
             firmware: FirmwarePane::default(),
             firmware_unchecked: true,
             screens: Vec::new(),
@@ -115,6 +119,14 @@ impl eframe::App for SettingsApp {
                         self.firmware.refresh();
                     }
                     self.tab = Tab::Firmware;
+                }
+
+                // Outside the tab match: both panes edit this one dongle.
+                if let Some(id) = &self.identity {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(id.name_str()).monospace())
+                            .on_hover_text(id.mac_str());
+                    });
                 }
             });
             ui.add_space(6.0);

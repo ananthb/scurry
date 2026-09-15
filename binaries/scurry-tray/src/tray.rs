@@ -424,7 +424,13 @@ impl App {
                 focus,
                 screens,
                 slots,
+                identity,
             } => {
+                // First line: which dongle the rest of the menu is about.
+                if let Some(id) = identity {
+                    let _ = menu.append(&MenuItem::new(id.name_str(), false, None));
+                }
+
                 let here = *focus == 0;
                 let name = screens
                     .iter()

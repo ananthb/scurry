@@ -430,6 +430,8 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 #define SCURRY_KIND_SET_WIRELESS 0x18
 #define SCURRY_KIND_GET_FIRMWARE 0x19
 #define SCURRY_KIND_FIRMWARE     0x1a
+#define SCURRY_KIND_GET_IDENTITY 0x1b
+#define SCURRY_KIND_IDENTITY    0x1c
 #define SCURRY_KIND_OTA_BEGIN    0x20
 #define SCURRY_KIND_OTA_DATA     0x21
 #define SCURRY_KIND_OTA_END      0x22
@@ -1089,6 +1091,19 @@ static void scurry_handle_set_wireless(const uint8_t *p, uint16_t len)
     }
 }
 
+/* Say which dongle this is: the advertised name, and the address it was
+   derived from. Both are computed at boot; neither is stored. */
+static void scurry_send_identity(void)
+{
+    /* The wire field is exactly this buffer, NUL padding included. */
+    _Static_assert(sizeof(HIDD_DEVICE_NAME) == 16,
+                   "the IDENTITY name field is 16 bytes; see scurry-proto NAME_LEN");
+    uint8_t buf[sizeof(HIDD_DEVICE_NAME) + 6] = {0};
+    memcpy(buf, HIDD_DEVICE_NAME, sizeof(HIDD_DEVICE_NAME));
+    memcpy(&buf[sizeof(HIDD_DEVICE_NAME)], scurry_mac, sizeof(scurry_mac));
+    scurry_reply(SCURRY_KIND_IDENTITY, buf, sizeof(buf));
+}
+
 /* Report what is running, and whether it can be replaced. The controller asks
    this before it decides anything: an older build with a single app slot says
    so here rather than failing a third of the way through a transfer. */
@@ -1256,6 +1271,9 @@ static void scurry_handle(uint8_t kind, uint16_t seq, const uint8_t *payload, ui
         break;
     case SCURRY_KIND_GET_FIRMWARE:
         scurry_send_firmware();
+        break;
+    case SCURRY_KIND_GET_IDENTITY:
+        scurry_send_identity();
         break;
     case SCURRY_KIND_OTA_BEGIN:
         scurry_handle_ota_begin(payload, len);
