@@ -36,6 +36,7 @@
 #include "scurry_ctl_svc.h"
 #include "scurry_button.h"
 #include "scurry_display.h"
+#include "scurry_led.h"
 #include "scurry_ota.h"
 
 /**
@@ -1625,6 +1626,10 @@ void app_main(void)
        image is flashed to both, and losing the mouse because a screen is
        missing would be a poor trade for a status readout. */
     scurry_display_start(scurry_display_poll);
+
+    /* Same snapshot as the display, for when the glass cannot be seen. A
+       board whose LED cannot be driven runs dark rather than not at all. */
+    scurry_led_start(scurry_display_poll);
 
     /* If this image arrived over the wire it is on probation until it has
        stayed up a while. Started last, so "stayed up" means everything above

@@ -43,6 +43,7 @@ guess.
 | dongle BLE HID firmware | working: mouse and keyboard reach bonded targets |
 | 0.42" OLED status display | working: identity, links, pairing window, passkey |
 | firmware updates over the link | working: verified over the cable, onto a live dongle |
+| WS2812 status LED | written, not yet verified on hardware |
 | wireless controller link | experimental; works, see [002](doc/experiments/002-wireless-control-link.md) |
 | Linux and Windows capture | not started |
 
@@ -125,6 +126,14 @@ Note that a dongle running firmware older than this has a single `factory`
 partition and nowhere to put a second image. It says so when asked, and needs
 one cable flash to gain the two-slot layout — after which it can update itself.
 NVS keeps its offset across that change, so bonds and the stored layout survive.
+
+### The status LED
+
+The board's second LED — the addressable one, not the power light — blinks
+while the pairing window is open and sits solid green while at least one target
+is connected. Dark otherwise. It answers the same question the screen does, for
+a dongle parked where the screen cannot be read, or a board with no screen
+soldered on.
 
 ### The optional screen
 
