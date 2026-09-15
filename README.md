@@ -43,8 +43,8 @@ guess.
 | dongle BLE HID firmware | working: mouse and keyboard reach bonded targets |
 | 0.42" OLED status display | working: identity, links, pairing window, passkey |
 | firmware updates over the link | working: verified over the cable, onto a live dongle |
-| provisioning a blank board | working: verified over the cable, onto a new board |
-| WS2812 status LED | written, not yet verified on hardware |
+| provisioning a blank board | written; not yet run against a board that needed it |
+| status LED | working: blink while pairing, solid while linked |
 | wireless controller link | experimental; works, see [002](doc/experiments/002-wireless-control-link.md) |
 | Linux and Windows capture | not started |
 
