@@ -154,11 +154,11 @@ RST tapped; after that one flash it updates itself like any other dongle.
 
 ### The status LED
 
-The board's second LED — the addressable one, not the power light — blinks
-while the pairing window is open and sits solid green while at least one target
-is connected. Dark otherwise. It answers the same question the screen does, for
-a dongle parked where the screen cannot be read, or a board with no screen
-soldered on.
+The board's second LED — the one that is not the power light — blinks while the
+pairing window is open and sits solid while at least one target is connected.
+Dark otherwise. It is a single colour, so the state is in the pattern rather
+than the hue. It answers the same question the screen does, for a dongle parked
+where the screen cannot be read, or a board with no screen soldered on.
 
 ### The optional screen
 

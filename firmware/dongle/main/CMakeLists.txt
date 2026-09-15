@@ -7,7 +7,7 @@ idf_component_register(SRCS "ble_hidd_demo_main.c"
                             "scurry_display.c"
                             "scurry_led.c"
                             "scurry_ota.c"
-                    PRIV_REQUIRES bt nvs_flash esp_driver_gpio esp_driver_i2c esp_driver_rmt esp_driver_usb_serial_jtag esp_ringbuf
+                    PRIV_REQUIRES bt nvs_flash esp_driver_gpio esp_driver_i2c esp_driver_usb_serial_jtag esp_ringbuf
                                  app_update esp_partition mbedtls
                     INCLUDE_DIRS ".")
 
